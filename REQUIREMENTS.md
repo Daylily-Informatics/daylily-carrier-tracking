@@ -4,7 +4,7 @@ Implementation contract for the unified multi-carrier tracking library + CLI.
 
 ## Goals
 - One Python package: `daylily_carrier_tracking`
-- One CLI entrypoint: `tracking_day`
+- One CLI entrypoint: `tday`
 - Input: a single tracking number (+ optional explicit carrier)
 - Output: **normalized ops-meta** (stable schema) + optional **raw** carrier payload
 
@@ -64,24 +64,27 @@ Defaults / missing conventions:
 - Auth/network errors: raise an informative exception in library (preferred); CLI prints to stderr + non-zero exit.
 
 ## CLI requirements
-Single console script: `tracking_day`.
+Single console script: `tday`.
 
 Global flags:
 - `--pretty`: pretty-print JSON.
 
 Subcommands (current contract):
-- `tracking_day fedex <TN> [--api-preference auto|track|ship] [--no-raw]`
-- `tracking_day track <TN> [--carrier auto|fedex|ups|usps] [--no-raw]`
-- `tracking_day ups <TN> [--no-raw]` (until implemented: exit 2)
-- `tracking_day usps <TN> [--no-raw]` (until implemented: exit 2)
+- `tday fedex <TN> [--api-preference auto|track|ship] [--no-raw]`
+- `tday track <TN> [--carrier auto|fedex|ups|usps] [--no-raw]`
+- `tday ups <TN> [--no-raw]` (until implemented: exit 2)
+- `tday usps <TN> [--no-raw]` (until implemented: exit 2)
 
 Output:
 - JSON to stdout.
 - Errors to stderr.
 
 ## Configuration & secrets
-### Primary mechanism: yaml_config_day
-Trackers should load credentials via `yaml_config_day` when `config` is not provided.
+### Primary mechanism: centralized YAML config
+Trackers should load credentials from `~/.config/daylily-carrier-tracking/<proj>_<env>.yaml` when `config` is not provided.
+
+Backward compatibility:
+- If the centralized file is missing, trackers may fall back to `yaml_config_day`'s legacy behavior.
 
 FedEx current config keys (required/used by implementation):
 - `client_id`
@@ -92,7 +95,7 @@ Optional overrides:
 - `ship_track_url`
 
 File convention:
-- `~/.config/<proj>/<proj>_<env>.yaml` (example: `~/.config/fedex/fedex_prod.yaml`)
+- `~/.config/daylily-carrier-tracking/<proj>_<env>.yaml` (example: `~/.config/daylily-carrier-tracking/fedex_prod.yaml`)
 
 ### Override mechanism: `config: dict`
 All trackers must accept `config: dict | None` so callers/tests can bypass `yaml_config_day`.

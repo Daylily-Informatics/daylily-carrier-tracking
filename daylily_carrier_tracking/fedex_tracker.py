@@ -36,6 +36,7 @@ def _get_nested(d: Dict[str, Any], path: Tuple[str, ...], default: Any = "") -> 
 
 def _default_ops_meta() -> Dict[str, Any]:
     return {
+        "Carrier": "",
         "Pickup_dt": "",
         "Delivery_dt": "",
         "Tender_dt": "",
@@ -67,6 +68,7 @@ def normalize_fedex_track_ops_meta(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
 
     ops = _default_ops_meta()
+    ops["Carrier"] = "fedex"
 
     track_results = _get_nested(raw, ("output", "completeTrackResults"), default=[])
     if not track_results:
@@ -226,16 +228,33 @@ class FedexTracker:
         ship_track_url: Optional[str] = None,
     ):
         if config is None:
+            cfg: Dict[str, Any]
+            # Preferred location (centralized):
+            #   ~/.config/daylily-carrier-tracking/<proj>_<env>.yaml
             try:
-                import yaml_config_day.config_manager as YCM  # type: ignore
-            except ModuleNotFoundError as e:
-                raise ModuleNotFoundError(
-                    "yaml_config_day is required when using config_proj_name/config_proj_env. "
-                    "Either install yaml_config_day or pass config={...} when constructing FedexTracker."
-                ) from e
+                from daylily_carrier_tracking.config import config_path, load_yaml_mapping
 
-            yconfig = YCM.ProjectConfigManager(config_proj_name, config_proj_env)
-            cfg = yconfig.get_config()
+                new_path = config_path(config_proj_name, config_proj_env)
+                if new_path.exists():
+                    cfg = load_yaml_mapping(new_path)
+                else:
+                    raise FileNotFoundError(str(new_path))
+            except Exception:
+                # Backward-compatible fallback:
+                #   ~/.config/<proj>/<proj>_<env>.yaml  (yaml_config_day)
+                try:
+                    import yaml_config_day.config_manager as YCM  # type: ignore
+                except ModuleNotFoundError as e:
+                    raise ModuleNotFoundError(
+                        "No config found in the new default location (~/.config/daylily-carrier-tracking/) "
+                        "and yaml_config_day is not installed for legacy config loading. "
+                        "Either install yaml_config_day, or create a config file at: "
+                        f"~/.config/daylily-carrier-tracking/{config_proj_name}_{config_proj_env}.yaml, "
+                        "or pass config={...} when constructing FedexTracker."
+                    ) from e
+
+                yconfig = YCM.ProjectConfigManager(config_proj_name, config_proj_env)
+                cfg = yconfig.get_config()
         else:
             cfg = dict(config)
 

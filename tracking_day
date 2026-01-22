@@ -1,0 +1,37 @@
+#!/bin/sh
+# Repo-friendly launcher for daylily-carrier-tracking.
+# Deprecated name: use ./tday (wrapper) or the installed console script `tday`.
+#
+# Pattern:
+# - Prefer a local .venv python if present
+# - Otherwise fall back to python3
+# - Ensure the repo root is on PYTHONPATH so the package can be imported
+
+set -eu
+
+REPO_ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
+
+PY=""
+if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+  PY="$REPO_ROOT/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PY="$(command -v python3)"
+elif command -v python >/dev/null 2>&1; then
+  PY="$(command -v python)"
+else
+  echo "ERROR: Could not find python3/python in PATH" 1>&2
+  exit 127
+fi
+
+# If not installed, importing the package needs the repo on PYTHONPATH.
+if [ -z "${PYTHONPATH:-}" ]; then
+  PYTHONPATH="$REPO_ROOT"
+else
+  PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
+fi
+export PYTHONPATH
+
+echo "WARNING: tracking_day is deprecated; use tday" 1>&2
+
+exec "$PY" -c 'import sys; sys.argv[0] = "tracking_day"; from daylily_carrier_tracking.cli import main; raise SystemExit(main())' "$@"
+

@@ -11,7 +11,8 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "tracking_day = daylily_carrier_tracking.cli:main",
+			"tday = daylily_carrier_tracking.cli:main",
+			"tracking_day = daylily_carrier_tracking.cli:main",  # deprecated alias
         ],
     },
 )

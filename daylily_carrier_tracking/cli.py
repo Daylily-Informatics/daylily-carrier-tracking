@@ -1,10 +1,15 @@
 import argparse
 import json
+import os
+import subprocess
 import sys
-from typing import Any, Dict, List, Optional
+from getpass import getpass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
 
+from daylily_carrier_tracking.config import config_path, load_yaml_mapping, write_yaml_mapping
 from daylily_carrier_tracking.fedex_tracker import FedexTracker
-from daylily_carrier_tracking.unified_tracker import UnifiedTracker
+from daylily_carrier_tracking.unified_tracker import UnifiedTracker, detect_carrier
 
 
 def _print_json(obj: Dict[str, Any], pretty: bool) -> None:
@@ -14,58 +19,585 @@ def _print_json(obj: Dict[str, Any], pretty: bool) -> None:
         print(json.dumps(obj))
 
 
+def _stderr_is_tty() -> bool:
+    try:
+        return bool(sys.stderr.isatty())
+    except Exception:
+        return False
+
+
+def _color_enabled(no_color: bool) -> bool:
+    if no_color:
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    return _stderr_is_tty()
+
+
+def _c(text: str, code: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _ok(text: str, enabled: bool) -> str:
+    return _c(text, "32", enabled)  # green
+
+
+def _warn(text: str, enabled: bool) -> str:
+    return _c(text, "33", enabled)  # yellow
+
+
+def _err(text: str, enabled: bool) -> str:
+    return _c(text, "31", enabled)  # red
+
+
+def _note(text: str, enabled: bool) -> str:
+    return _c(text, "36", enabled)  # cyan
+
+
+def _eprint(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def _default_config_path(carrier: str, env: str) -> Path:
+    # Centralized config dir: ~/.config/daylily-carrier-tracking/<carrier>_<env>.yaml
+    return config_path(carrier, env)
+
+
+def _prompt(label: str, default: Optional[str] = None, secret: bool = False, required: bool = False) -> str:
+    while True:
+        suffix = f" [{default}]" if default else ""
+        prompt = f"{label}{suffix}: "
+        raw = getpass(prompt) if secret else input(prompt)
+        raw = (raw or "").strip()
+        if raw:
+            return raw
+        if default is not None and default != "":
+            return default
+        if not required:
+            return ""
+        print("Value is required.")
+
+
+def _run_subprocess(cmd: Sequence[str], cwd: Optional[Path] = None) -> int:
+    p = subprocess.run(list(cmd), cwd=str(cwd) if cwd else None)
+    return int(getattr(p, "returncode", 1) or 0)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="tracking_day", description="Multi-carrier tracking (FedEx implemented; UPS/USPS pending)")
-    p.add_argument("--pretty", action="store_true", help="Pretty-print JSON")
+    # Do not hardcode `prog` so installed entrypoints (tday) and repo wrappers
+    # (tracking_day/tday) show the correct command name in --help output.
+    p = argparse.ArgumentParser(
+        description=(
+            "Unified multi-carrier tracking CLI. "
+            "Commands: test, configure, track. "
+            "FedEx is implemented; UPS/USPS are scaffolded."
+        ),
+    )
+
+    # Keep these on the top-level parser so `tday --help` advertises them and
+    # users can still write `tday --pretty track ...`.
+    p.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
+    p.add_argument("--no-color", action="store_true", help="Disable ANSI colored status output")
+
+    # Also attach common flags to subcommands so users can write the more
+    # natural `tday track ... --pretty` / `tday track ... --no-color`.
+    common = argparse.ArgumentParser(add_help=False)
+    # Use SUPPRESS so subparsers don't overwrite values already parsed from the
+    # top-level parser (e.g. `tday --pretty track ...`).
+    common.add_argument(
+        "--no-color",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Disable ANSI colored status output",
+    )
+    json_out = argparse.ArgumentParser(add_help=False)
+    json_out.add_argument(
+        "--pretty",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Pretty-print JSON output",
+    )
+
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    fedex = sub.add_parser("fedex", help="Track a FedEx tracking number")
+    test = sub.add_parser("test", parents=[common], help="Run unit tests")
+    test.add_argument(
+        "--test-fedex",
+        action="store_true",
+        help="Run only FedEx-related tests (pattern: tests/test_fedex_*.py)",
+    )
+    test.add_argument(
+        "--test-ups",
+        action="store_true",
+        help="Run only UPS-related tests (pattern: tests/test_ups_*.py)",
+    )
+    test.add_argument(
+        "--test-usps",
+        action="store_true",
+        help="Run only USPS-related tests (pattern: tests/test_usps_*.py)",
+    )
+
+    cfg = sub.add_parser("configure", parents=[common], help="Interactive credential setup wizard")
+    cfg.add_argument("carrier", choices=["fedex", "ups", "usps"], help="Carrier to configure")
+    cfg.add_argument("--env", default="prod", help="Config environment name (default: prod)")
+    cfg.add_argument(
+        "--path",
+        default=None,
+        help=(
+            "Override output YAML path (default: "
+            "~/.config/daylily-carrier-tracking/<carrier>_<env>.yaml)"
+        ),
+    )
+    cfg.add_argument("--skip-validate", action="store_true", help="Do not attempt a live credential validation call")
+
+    track = sub.add_parser("track", parents=[common, json_out], help="Live tracking call (prints JSON result)")
+    track.add_argument("tracking_number", help="Tracking number")
+    track.add_argument(
+        "--carrier",
+        default="auto",
+        choices=["auto", "fedex", "ups", "usps"],
+        help="Carrier selection (default: auto via detect_carrier())",
+    )
+    track.add_argument("--no-raw", action="store_true", help="Omit raw carrier payload from JSON output")
+    track.add_argument(
+        "--api-preference",
+        default="auto",
+        choices=["auto", "track", "ship"],
+        help="FedEx only: route to track/ship endpoint (default: auto)",
+    )
+
+    # Legacy compatibility (do not duplicate logic; main() maps these to track).
+    fedex = sub.add_parser(
+        "fedex",
+        parents=[common, json_out],
+        help="(deprecated) Alias of: track --carrier fedex",
+    )
     fedex.add_argument("tracking_number")
     fedex.add_argument("--api-preference", default="auto", choices=["auto", "track", "ship"], help="Route to track/ship endpoint")
     fedex.add_argument("--no-raw", action="store_true", help="Omit raw response")
 
-    track = sub.add_parser("track", help="Track with carrier routing")
-    track.add_argument("tracking_number")
-    track.add_argument("--carrier", default="auto", choices=["auto", "fedex", "ups", "usps"], help="Carrier selection")
-    track.add_argument("--no-raw", action="store_true", help="Omit raw response")
-
-    ups = sub.add_parser("ups", help="Track a UPS tracking number (not implemented)")
+    ups = sub.add_parser("ups", parents=[common, json_out], help="(deprecated) Alias of: track --carrier ups")
     ups.add_argument("tracking_number")
     ups.add_argument("--no-raw", action="store_true", help="Omit raw response")
 
-    usps = sub.add_parser("usps", help="Track a USPS tracking number (not implemented)")
+    usps = sub.add_parser("usps", parents=[common, json_out], help="(deprecated) Alias of: track --carrier usps")
     usps.add_argument("tracking_number")
     usps.add_argument("--no-raw", action="store_true", help="Omit raw response")
 
+    doctor = sub.add_parser(
+        "doctor",
+        parents=[common],
+        help="Diagnose configuration + (optionally) test live FedEx OAuth/track",
+    )
+    doctor.add_argument(
+        "--carrier",
+        default="fedex",
+        choices=["auto", "fedex", "ups", "usps"],
+        help="Carrier to diagnose (default: fedex)",
+    )
+    doctor.add_argument("--env", default="prod", help="Config environment name (default: prod)")
+    doctor.add_argument(
+        "--config-path",
+        default=None,
+        help="Override config YAML path (otherwise uses ~/.config/daylily-carrier-tracking/<carrier>_<env>.yaml)",
+    )
+    doctor.add_argument(
+        "--no-network",
+        action="store_true",
+        help="Do not make network calls (OAuth/track).",
+    )
+    doctor.add_argument(
+        "--tracking-number",
+        default=None,
+        help="Optional: also perform a live track call (FedEx only).",
+    )
+    doctor.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON to stdout (CI/support-ticket friendly).",
+    )
+
     return p
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    color = _color_enabled(bool(getattr(args, "no_color", False)))
+    json_mode = bool(getattr(args, "json", False))
+
+    carrier_requested = str(getattr(args, "carrier", "fedex") or "fedex").lower()
+    env = str(getattr(args, "env", "prod") or "prod").lower()
+    tn = getattr(args, "tracking_number", None)
+    detected = detect_carrier(str(tn)) if tn else None
+    carrier_effective = detected if carrier_requested == "auto" else carrier_requested
+
+    final_rc = 0
+    report: Dict[str, Any] = {
+        "doctor_version": 1,
+        "carrier": {
+            "requested": carrier_requested,
+            "detected": detected,
+            "effective": carrier_effective,
+        },
+        "env": env,
+        "python": {"executable": sys.executable, "version": sys.version},
+        "package": {},
+        "config": {
+            "source": None,
+            "path": None,
+            "exists": False,
+            "keys": [],
+            "required": [],
+            "presence": {},
+        },
+        "network": {
+            "requested": not bool(getattr(args, "no_network", False)),
+            "implemented": carrier_effective == "fedex",
+            "note": None,
+            "oauth": None,
+            "track": None,
+        },
+        "tracking": {"number": str(tn) if tn else None, "normalized": None},
+    }
+
+    def _human(msg: str) -> None:
+        if not json_mode:
+            _eprint(msg)
+
+    _human(_note(f"Doctor: carrier={carrier_effective} env={env}", color))
+    _human(_note(f"Python: {sys.executable} ({sys.version.split()[0]})", color))
+    try:
+        import daylily_carrier_tracking as pkg  # noqa: F401
+
+        report["package"] = {"file": getattr(pkg, "__file__", None)}
+        if getattr(pkg, "__file__", None):
+            _human(_note(f"Package: {pkg.__file__}", color))
+    except Exception as e:
+        report["package"] = {"error": f"{type(e).__name__}: {e}"}
+
+    if carrier_requested == "auto" and not tn:
+        report["error"] = "carrier=auto requires --tracking-number"
+        if json_mode:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            _human(_err("ERROR: carrier=auto requires --tracking-number", color))
+        return 2
+
+    resolved_path: Optional[Path]
+    source: str
+    if getattr(args, "config_path", None):
+        resolved_path = Path(str(args.config_path)).expanduser()
+        source = "override"
+    else:
+        resolved_path = config_path(carrier_effective, env)
+        source = "centralized"
+
+    report["config"]["source"] = source
+    report["config"]["path"] = str(resolved_path)
+    report["config"]["exists"] = resolved_path.exists()
+
+    _human(_note(f"Config ({source}): {resolved_path}", color))
+
+    cfg: Dict[str, Any] = {}
+    if resolved_path.exists():
+        try:
+            cfg = load_yaml_mapping(resolved_path)
+            report["config"]["keys"] = sorted(list(cfg.keys()))
+            _human(_note(f"Config keys: {report['config']['keys']}", color))
+        except Exception as e:
+            report["config"]["load_error"] = f"{type(e).__name__}: {e}"
+            if json_mode:
+                print(json.dumps(report, indent=2, sort_keys=True))
+            else:
+                _human(_err(f"ERROR: Failed to load YAML: {type(e).__name__}: {e}", color))
+            return 2
+    else:
+        # For FedEx we still treat missing config as an error; for UPS/USPS we
+        # keep going to emit a useful stub report.
+        if carrier_effective == "fedex":
+            report["config"]["missing_note"] = "Expected: ~/.config/daylily-carrier-tracking/<carrier>_<env>.yaml"
+            if json_mode:
+                print(json.dumps(report, indent=2, sort_keys=True))
+            else:
+                _human(_err("ERROR: Config file does not exist.", color))
+                _human(_note("Expected: ~/.config/daylily-carrier-tracking/<carrier>_<env>.yaml", color))
+                _human(_note("(For backward compatibility, FedEx tracker can also fall back to yaml_config_day.)", color))
+            return 2
+
+    def _present_len(k: str) -> str:
+        v = cfg.get(k)
+        if v is None:
+            return "missing"
+        s = str(v)
+        return f"present(len={len(s)})"
+
+    # Carrier-specific config validation
+    if carrier_effective == "fedex":
+        oauth_url = cfg.get("oauth_url") or cfg.get("api_url")
+        report["config"]["required"] = ["oauth_url|api_url", "client_id", "client_secret"]
+        report["config"]["presence"] = {
+            "oauth_url|api_url": "present" if oauth_url else "missing",
+            "client_id": _present_len("client_id"),
+            "client_secret": _present_len("client_secret"),
+        }
+        report["config"]["oauth_url"] = oauth_url
+
+        _human(_note(f"oauth_url/api_url: {oauth_url or '<missing>'}", color))
+        _human(_note(f"client_id: {report['config']['presence']['client_id']}", color))
+        _human(_note(f"client_secret: {report['config']['presence']['client_secret']}", color))
+
+        if not oauth_url or not cfg.get("client_id") or not cfg.get("client_secret"):
+            report["config"]["valid"] = False
+            report["error"] = "Missing required FedEx config keys"
+            if json_mode:
+                print(json.dumps(report, indent=2, sort_keys=True))
+            else:
+                _human(_err("ERROR: Missing required FedEx config keys.", color))
+            return 2
+        report["config"]["valid"] = True
+    elif carrier_effective in {"ups", "usps"}:
+        report["config"]["required"] = ["client_id", "client_secret"]
+        report["config"]["presence"] = {
+            "client_id": _present_len("client_id"),
+            "client_secret": _present_len("client_secret"),
+        }
+        report["config"]["valid"] = bool(cfg.get("client_id") and cfg.get("client_secret"))
+        # CI strictness: missing/invalid config for UPS/USPS should fail.
+        final_rc = 0 if report["config"]["valid"] else 2
+        report["network"]["implemented"] = False
+        report["network"]["note"] = "network checks not implemented for this carrier"
+        _human(_warn("Doctor: network checks not implemented for this carrier.", color))
+    else:
+        report["error"] = "Unhandled carrier"
+        if json_mode:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            _human(_err("ERROR: Unhandled carrier", color))
+        return 2
+
+    # Optional: always include a normalized response blob when tracking number is provided.
+    if tn:
+        try:
+            ut = UnifiedTracker(fedex_config_proj_env=env, fedex_config=cfg if carrier_effective == "fedex" else None)
+            ops = ut.track_ops_meta(str(tn), carrier=carrier_effective)
+            report["tracking"]["normalized"] = ops
+        except Exception as e:
+            report["tracking"]["normalized_error"] = f"{type(e).__name__}: {e}"
+
+    # Network checks (FedEx only)
+    if carrier_effective == "fedex":
+        if bool(getattr(args, "no_network", False)):
+            report["network"]["note"] = "skipped per --no-network"
+            _human(_warn("Skipping network checks (per --no-network).", color))
+            if json_mode:
+                print(json.dumps(report, indent=2, sort_keys=True))
+            return 0
+
+        report["network"]["implemented"] = True
+        _human(_note("Network check: requesting OAuth token...", color))
+        try:
+            ft = FedexTracker(config=cfg)
+            token = ft.auth_token()
+            report["network"]["oauth"] = {"ok": True, "token_len": len(token)}
+            _human(_ok(f"OAuth OK (token acquired; length={len(token)}).", color))
+        except Exception as e:
+            status = None
+            body = None
+            try:
+                resp = getattr(e, "response", None)
+                status = getattr(resp, "status_code", None)
+                body = getattr(resp, "text", None)
+            except Exception:
+                pass
+            report["network"]["oauth"] = {
+                "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+                "http_status": status,
+                "response_body": (body[:400] if body else None),
+            }
+            if json_mode:
+                print(json.dumps(report, indent=2, sort_keys=True))
+            else:
+                if status is not None:
+                    _human(_err(f"OAuth FAILED: HTTP {status}", color))
+                    if body:
+                        _human(_err(f"Response body (first 400 chars): {body[:400]}", color))
+                else:
+                    _human(_err(f"OAuth FAILED: {type(e).__name__}: {e}", color))
+            return 3
+
+        if tn:
+            _human(_note(f"Network check: tracking {tn}...", color))
+            try:
+                out = ft.track(str(tn), api_preference="auto", include_raw=False)
+                report["network"]["track"] = {"ok": True, "response": out}
+                _human(_ok("Track OK.", color))
+            except Exception as e:
+                report["network"]["track"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                if json_mode:
+                    print(json.dumps(report, indent=2, sort_keys=True))
+                else:
+                    _human(_err(f"Track FAILED: {type(e).__name__}: {e}", color))
+                return 4
+
+    if json_mode:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    return final_rc
+
+
+def _cmd_test(args: argparse.Namespace) -> int:
+    color = _color_enabled(bool(getattr(args, "no_color", False)))
+    tests_dir = Path.cwd() / "tests"
+    if not tests_dir.exists():
+        _eprint(_err("ERROR: tests/ directory not found. Run from the repo root.", color))
+        return 2
+
+    selections: List[str] = []
+    if args.test_fedex:
+        selections.append("fedex")
+    if args.test_ups:
+        selections.append("ups")
+    if args.test_usps:
+        selections.append("usps")
+
+    if not selections:
+        _eprint(_note("Running full test suite...", color))
+        return _run_subprocess([sys.executable, "-m", "unittest", "discover", "-s", "tests"], cwd=Path.cwd())
+
+    rc = 0
+    for carrier in selections:
+        pattern = f"test_{carrier}_*.py"
+        matches = list(tests_dir.glob(pattern))
+        if not matches:
+            _eprint(_warn(f"No tests matched {pattern} (carrier '{carrier}' likely not implemented yet).", color))
+            rc = max(rc, 2)
+            continue
+        _eprint(_note(f"Running {carrier} tests ({pattern})...", color))
+        rc = max(
+            rc,
+            _run_subprocess(
+                [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", pattern],
+                cwd=Path.cwd(),
+            ),
+        )
+    return rc
+
+
+def _cmd_configure_fedex(args: argparse.Namespace) -> int:
+    color = _color_enabled(bool(getattr(args, "no_color", False)))
+    env = str(args.env)
+    path = Path(args.path) if args.path else _default_config_path("fedex", env)
+
+    _eprint(_note("FedEx credential setup (writes YAML config)", color))
+    client_id = _prompt("client_id", required=True)
+    client_secret = _prompt("client_secret", secret=True, required=True)
+    oauth_url = _prompt("oauth_url", default="https://apis.fedex.com/oauth/token", required=True)
+    track_url = _prompt("track_url (optional)", default="https://apis.fedex.com/track/v1/trackingnumbers", required=False)
+    ship_track_url = _prompt("ship_track_url (optional)", default="", required=False)
+
+    cfg: Dict[str, Any] = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "oauth_url": oauth_url,
+        "track_url": track_url or None,
+        "ship_track_url": ship_track_url or None,
+    }
+
+    write_yaml_mapping(path, cfg)
+    _eprint(_ok(f"Wrote: {path}", color))
+
+    if args.skip_validate:
+        _eprint(_warn("Skipping live validation (per --skip-validate).", color))
+        return 0
+
+    _eprint(_note("Validating credentials via OAuth token request...", color))
+    try:
+        ft = FedexTracker(config=cfg)
+        token = ft.auth_token()
+        _eprint(_ok(f"Validation OK (token acquired; length={len(token)}).", color))
+        return 0
+    except Exception as e:
+        _eprint(_err(f"Validation FAILED: {type(e).__name__}: {e}", color))
+        return 3
+
+
+def _cmd_configure(args: argparse.Namespace) -> int:
+    carrier = str(args.carrier).lower()
+    color = _color_enabled(bool(getattr(args, "no_color", False)))
+    if carrier == "fedex":
+        return _cmd_configure_fedex(args)
+    if carrier in {"ups", "usps"}:
+        path = Path(args.path) if args.path else _default_config_path(carrier, str(args.env))
+        _eprint(_warn(f"{carrier.upper()} configuration is scaffolded but validation is not implemented yet.", color))
+        _eprint(_note(f"Creating placeholder config at: {path}", color))
+        placeholder = {
+            "client_id": "",
+            "client_secret": "",
+            "oauth_url": "",
+        }
+        write_yaml_mapping(path, placeholder)
+        return 2
+    raise ValueError("Unhandled carrier")
+
+
+def _cmd_track(args: argparse.Namespace) -> int:
+    color = _color_enabled(bool(getattr(args, "no_color", False)))
+    tn = str(args.tracking_number)
+    carrier = str(args.carrier).lower()
+    include_raw = not bool(args.no_raw)
+    api_preference = str(getattr(args, "api_preference", "auto")).lower()
+
+    resolved_carrier = carrier
+    if carrier == "auto":
+        resolved_carrier = detect_carrier(tn)
+        _eprint(_note(f"Auto-detected carrier: {resolved_carrier}", color))
+
+    try:
+        if resolved_carrier == "fedex":
+            ft = FedexTracker()
+            out = ft.track(tn, api_preference=api_preference, include_raw=include_raw)
+        else:
+            if api_preference != "auto":
+                _eprint(_warn("--api-preference is FedEx-only; ignoring for non-FedEx carriers.", color))
+            ut = UnifiedTracker()
+            out = ut.track(tn, carrier=resolved_carrier, include_raw=include_raw)
+
+        _eprint(_ok("Track call completed.", color))
+        _print_json(out, pretty=bool(args.pretty))
+        return 0
+    except NotImplementedError as e:
+        _eprint(_err(f"ERROR: {e}", color))
+        return 2
+    except Exception as e:
+        _eprint(_err(f"ERROR: {type(e).__name__}: {e}", color))
+        return 1
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
-    try:
-        if args.cmd == "fedex":
-            ft = FedexTracker()
-            out = ft.track(args.tracking_number, api_preference=args.api_preference, include_raw=(not args.no_raw))
-            _print_json(out, pretty=args.pretty)
-            return 0
+    if args.cmd == "test":
+        return _cmd_test(args)
+    if args.cmd == "configure":
+        return _cmd_configure(args)
+    if args.cmd == "track":
+        return _cmd_track(args)
+    if args.cmd == "doctor":
+        return _cmd_doctor(args)
 
-        if args.cmd == "track":
-            ut = UnifiedTracker()
-            out = ut.track(args.tracking_number, carrier=args.carrier, include_raw=(not args.no_raw))
-            _print_json(out, pretty=args.pretty)
-            return 0
+    # Deprecated aliases (kept for backward compatibility).
+    if args.cmd in {"fedex", "ups", "usps"}:
+        args2 = argparse.Namespace(**vars(args))
+        args2.cmd = "track"
+        args2.carrier = args.cmd
+        if not hasattr(args2, "api_preference"):
+            args2.api_preference = "auto"
+        return _cmd_track(args2)
 
-        if args.cmd in {"ups", "usps"}:
-            ut = UnifiedTracker()
-            out = ut.track(args.tracking_number, carrier=args.cmd, include_raw=(not args.no_raw))
-            _print_json(out, pretty=args.pretty)
-            return 0
-
-        raise ValueError("Unhandled command")
-    except NotImplementedError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 2
+    color = _color_enabled(bool(getattr(args, "no_color", False)))
+    _eprint(_err("ERROR: Unhandled command", color))
+    return 1
 
 
 if __name__ == "__main__":

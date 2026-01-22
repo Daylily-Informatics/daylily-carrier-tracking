@@ -34,11 +34,21 @@ class UnifiedTracker:
         fedex_config_proj_env: str = "prod",
         fedex_config: Optional[Dict[str, Any]] = None,
     ):
-        self._fedex = FedexTracker(
-            config_proj_name=fedex_config_proj_name,
-            config_proj_env=fedex_config_proj_env,
-            config=fedex_config,
-        )
+        # Lazily construct per-carrier trackers so that requesting an
+        # unimplemented carrier (UPS/USPS) does not require unrelated creds.
+        self._fedex_config_proj_name = fedex_config_proj_name
+        self._fedex_config_proj_env = fedex_config_proj_env
+        self._fedex_config = fedex_config
+        self._fedex: Optional[FedexTracker] = None
+
+    def _get_fedex(self) -> FedexTracker:
+        if self._fedex is None:
+            self._fedex = FedexTracker(
+                config_proj_name=self._fedex_config_proj_name,
+                config_proj_env=self._fedex_config_proj_env,
+                config=self._fedex_config,
+            )
+        return self._fedex
 
     def track(self, tracking_number: str, carrier: str = "auto", include_raw: bool = True) -> Dict[str, Any]:
         carrier = (carrier or "auto").lower()
@@ -46,7 +56,7 @@ class UnifiedTracker:
             carrier = detect_carrier(tracking_number)
 
         if carrier == "fedex":
-            return self._fedex.track(tracking_number, include_raw=include_raw)
+            return self._get_fedex().track(tracking_number, include_raw=include_raw)
         if carrier in {"ups", "usps"}:
             raise NotImplementedError(
                 f"Carrier '{carrier}' is not implemented yet. "
@@ -55,7 +65,16 @@ class UnifiedTracker:
         raise ValueError("carrier must be one of: auto, fedex, ups, usps")
 
     def track_ops_meta(self, tracking_number: str, carrier: str = "auto") -> Dict[str, Any]:
+        carrier_in = (carrier or "auto").lower()
+        effective = detect_carrier(tracking_number) if carrier_in == "auto" else carrier_in
+
         try:
-            return self.track(tracking_number, carrier=carrier, include_raw=False)["ops_meta"]
+            ops = self.track(tracking_number, carrier=effective, include_raw=False)["ops_meta"]
+            # Safety rail: ensure normalized response includes the carrier id.
+            if isinstance(ops, dict) and not ops.get("Carrier"):
+                ops["Carrier"] = effective
+            return ops
         except NotImplementedError:
-            return default_ops_meta()
+            ops = default_ops_meta()
+            ops["Carrier"] = effective
+            return ops

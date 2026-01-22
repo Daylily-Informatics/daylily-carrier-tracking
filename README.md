@@ -13,14 +13,12 @@ pip install -e .
 
 ## Configure FedEx credentials
 
-By default it uses `yaml_config_day`.
-
 Create:
 
 ```text
-~/.config/fedex/fedex_prod.yaml
+~/.config/daylily-carrier-tracking/fedex_prod.yaml
 ---
-api_url: https://apis.fedex.com/oauth/token
+oauth_url: https://apis.fedex.com/oauth/token
 client_id: ...
 client_secret: ...
 # optional overrides:
@@ -28,12 +26,19 @@ client_secret: ...
 # ship_track_url: https://apis.fedex.com/ship/v1/trackingnumbers
 ```
 
+Notes:
+- The library/CLI will **prefer** `~/.config/daylily-carrier-tracking/<carrier>_<env>.yaml`.
+- For backward compatibility, if that file is missing it will fall back to `yaml_config_day`'s legacy location `~/.config/<carrier>/<carrier>_<env>.yaml`.
+
 ## CLI
 
 ```bash
+tday --help
+tday fedex <TRACKING_NUMBER> --api-preference auto|track|ship [--no-raw] [--pretty]
+tday track <TRACKING_NUMBER> --carrier auto|fedex|ups|usps [--no-raw] [--pretty]
+
+# deprecated alias:
 tracking_day --help
-tracking_day fedex <TRACKING_NUMBER> --api-preference auto|track|ship [--no-raw] [--pretty]
-tracking_day track <TRACKING_NUMBER> --carrier auto|fedex|ups|usps [--no-raw] [--pretty]
 ```
 
 ## Tests

@@ -1,0 +1,34 @@
+#!/bin/sh
+# Repo-friendly launcher for daylily-carrier-tracking.
+#
+# Prefer using the installed console script (tday) via:
+#   pip install -e .
+#
+# This wrapper is convenient for repo checkout usage without installation.
+
+set -eu
+
+REPO_ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
+
+PY=""
+if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+  PY="$REPO_ROOT/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PY="$(command -v python3)"
+elif command -v python >/dev/null 2>&1; then
+  PY="$(command -v python)"
+else
+  echo "ERROR: Could not find python3/python in PATH" 1>&2
+  exit 127
+fi
+
+# If not installed, importing the package needs the repo on PYTHONPATH.
+if [ -z "${PYTHONPATH:-}" ]; then
+  PYTHONPATH="$REPO_ROOT"
+else
+  PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
+fi
+export PYTHONPATH
+
+exec "$PY" -c 'import sys; sys.argv[0] = "tday"; from daylily_carrier_tracking.cli import main; raise SystemExit(main())' "$@"
+
