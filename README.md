@@ -10,6 +10,19 @@ Unified multi-carrier package tracking library + CLI.
 
 ## Install
 
+### Install from PyPI (recommended for end users)
+
+This installs the library and the `tday` CLI into your environment.
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -U pip
+python -m pip install daylily-carrier-tracking
+
+tday --help
+```
+
 ### Recommended (development, isolated virtualenv)
 
 This repo includes a helper script that **always** installs into a local `./.venv` so you don't accidentally `pip install -e .` into your system/base Python.
