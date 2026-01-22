@@ -1,18 +1,24 @@
 #!/bin/sh
 # Repo-friendly launcher for daylily-carrier-tracking.
 #
-# Prefer using the installed console script (tday) via:
-#   pip install -e .
-#
 # This wrapper is convenient for repo checkout usage without installation.
+# It is also venv-friendly:
+#   - If ./.venv exists, we *always* run with ./.venv/bin/python
+#   - Otherwise we fall back to python3/python on PATH (and emit a note)
+#
+# Recommended dev workflow (avoids polluting system Python):
+#   ./dev-setup.sh
+#   ./tday --help
 
 set -eu
 
 REPO_ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
 
 PY=""
+USING_VENV=0
 if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
   PY="$REPO_ROOT/.venv/bin/python"
+  USING_VENV=1
 elif command -v python3 >/dev/null 2>&1; then
   PY="$(command -v python3)"
 elif command -v python >/dev/null 2>&1; then
@@ -20,6 +26,10 @@ elif command -v python >/dev/null 2>&1; then
 else
   echo "ERROR: Could not find python3/python in PATH" 1>&2
   exit 127
+fi
+
+if [ "$USING_VENV" -ne 1 ]; then
+  echo "NOTE: .venv not found; using system python ($PY). Run ./dev-setup.sh for an isolated dev env." >&2
 fi
 
 # If not installed, importing the package needs the repo on PYTHONPATH.

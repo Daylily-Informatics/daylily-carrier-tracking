@@ -1,0 +1,17 @@
+# Example direnv config for this repo.
+#
+# Usage:
+#   cp .envrc.example .envrc
+#   direnv allow
+#
+# Notes:
+# - .envrc is intentionally gitignored.
+# - This does NOT create the venv for you.
+#   Run: ./dev-setup.sh
+
+if [ -f .venv/bin/activate ]; then
+  . .venv/bin/activate
+else
+  echo "No .venv found. Run: ./dev-setup.sh" >&2
+fi
+

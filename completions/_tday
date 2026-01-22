@@ -1,0 +1,98 @@
+#compdef tday
+
+# Zsh tab completion for `tday`.
+#
+# One-shot:
+#   source <(tday completion zsh)
+#
+# Install (example):
+#   mkdir -p ~/.zsh/completions
+#   tday completion zsh > ~/.zsh/completions/_tday
+#   # then ensure ~/.zsh/completions is in $fpath and compinit is enabled
+
+_tday() {
+	local -a subcmds global_opts
+	subcmds=(test configure track doctor completion fedex ups usps)
+  global_opts=(--pretty --no-color -h --help)
+
+  # Find the first subcommand (global flags may appear before/after).
+  local cmd=""
+  local w
+  for w in $words; do
+    if (( ${subcmds[(I)$w]} )); then
+      cmd="$w"
+      break
+    fi
+  done
+
+  local prev=${words[CURRENT-1]}
+  case $prev in
+    --carrier)
+      _values 'carrier' auto fedex ups usps
+      return
+      ;;
+    --api-preference)
+      _values 'api preference' auto track ship
+      return
+      ;;
+    --env)
+      _values 'env' prod test sandbox dev
+      return
+      ;;
+    --path|--config-path)
+      _files
+      return
+      ;;
+  esac
+
+  if [[ -z "$cmd" ]]; then
+    if [[ ${words[CURRENT]} == -* ]]; then
+      _values 'options' $global_opts
+    else
+      _values 'command' $subcmds
+    fi
+    return
+  fi
+
+  local cmd_i=${words[(i)$cmd]}
+  if [[ $cmd == configure && $CURRENT -eq $((cmd_i + 1)) ]]; then
+    _values 'carrier' fedex ups usps
+    return
+  fi
+
+	if [[ $cmd == completion && $CURRENT -eq $((cmd_i + 1)) ]]; then
+	  _values 'shell' bash zsh
+	  return
+	fi
+
+  local -a opts
+  case $cmd in
+    test)
+      opts=($global_opts --test-fedex --test-ups --test-usps)
+      ;;
+    configure)
+      opts=($global_opts --env --path --skip-validate)
+      ;;
+    track)
+      opts=($global_opts --carrier --no-raw --api-preference)
+      ;;
+    doctor)
+      opts=($global_opts --all --carrier --env --config-path --no-network --tracking-number --json)
+      ;;
+	  completion)
+	    opts=($global_opts)
+	    ;;
+    fedex)
+      opts=($global_opts --api-preference --no-raw)
+      ;;
+    ups|usps)
+      opts=($global_opts --no-raw)
+      ;;
+  esac
+
+  if [[ ${words[CURRENT]} == -* ]]; then
+    _values 'options' $opts
+  fi
+}
+
+compdef _tday tday

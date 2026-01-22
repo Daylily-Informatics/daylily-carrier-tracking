@@ -12,8 +12,10 @@ set -eu
 REPO_ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
 
 PY=""
+USING_VENV=0
 if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
   PY="$REPO_ROOT/.venv/bin/python"
+  USING_VENV=1
 elif command -v python3 >/dev/null 2>&1; then
   PY="$(command -v python3)"
 elif command -v python >/dev/null 2>&1; then
@@ -21,6 +23,10 @@ elif command -v python >/dev/null 2>&1; then
 else
   echo "ERROR: Could not find python3/python in PATH" 1>&2
   exit 127
+fi
+
+if [ "$USING_VENV" -ne 1 ]; then
+  echo "NOTE: .venv not found; using system python ($PY). Run ./dev-setup.sh for an isolated dev env." >&2
 fi
 
 # If not installed, importing the package needs the repo on PYTHONPATH.
