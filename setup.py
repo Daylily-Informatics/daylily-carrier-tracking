@@ -9,7 +9,7 @@ LONG_DESCRIPTION = (HERE / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="daylily_carrier_tracking",
-    version="0.1.0",
+    use_scm_version=True,
     description="Unified multi-carrier tracking (FedEx implemented; UPS/USPS pending)",
     long_description=LONG_DESCRIPTION,
     long_description_content_type="text/markdown",
