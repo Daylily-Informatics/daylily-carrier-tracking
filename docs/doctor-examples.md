@@ -1,87 +1,47 @@
-# `tday doctor` examples (JSON)
+# Diagnose carrier configuration with tday doctor
 
-This doc shows copy/paste examples and sample (redacted) JSON payloads for support tickets and CI.
+Use `tday recognize` when you only need to identify a barcode. Use `tday doctor` to inspect the carrier selection, configuration and, when requested, provider access. Add `--json` for the version 2 machine-readable report.
 
-## Notes
+## Offline examples
 
-- `--json` prints **valid JSON to stdout** and suppresses human/colored output.
-- Secrets are never printed. Sensitive fields show only presence/length.
-- UPS/USPS network checks are **not implemented yet** (config validation only).
-
----
-
-## FedEx: config + OAuth + optional track
-
-```bash
-tday doctor --carrier fedex --env prod --tracking-number 395579987149 --json | jq
+```sh
+tday recognize '0000-NORTH-7' --pretty
+tday doctor --tracking-number '0000-NORTH-7' --no-network --json
+tday doctor --tracking-number 'RB123456785GB' --no-network --json
+tday doctor --carrier fedex --env prod --no-network --json
 ```
 
-Key fields to look at:
-- `.config.valid` (bool)
-- `.network.oauth.ok` (bool)
-- `.network.track.ok` (bool)
+Both scans are valid inputs to the recognition command, which exits 0. For the unfamiliar scan, the doctor report contains `recognition.status="unknown"`. For the S10 postal scan the status is `ambiguous`. In both cases the detected and effective carrier are null, configuration is not loaded, and doctor exits 2 because it cannot select a provider to diagnose. The explicit FedEx example inspects the production profile locally. With `--no-network`, no OAuth or carrier request is made.
 
----
+## FedEx OAuth and lookup
 
-## UPS/USPS: config validation (stubbed)
-
-```bash
-tday doctor --carrier ups --env prod --json | jq
-tday doctor --carrier usps --env prod --json | jq
+```sh
+tday doctor --carrier fedex --env prod --json
+tday doctor --carrier fedex --tracking-number "$TRACKING_NUMBER" --json
 ```
 
-Expected today:
-- `.network.implemented == false`
-- `.network.note == "network checks not implemented for this carrier"`
+The first command requests an OAuth token using the selected configuration. The second performs a live FedEx lookup for the supplied number and includes the outcome at `network.track.response`. On success, `tracking.normalized` contains the FedEx metadata. On a failed tracking call the outcome includes the provider reason and operator-safe message. Use a tracking number for which you intend to make a live request.
 
----
+With no carrier argument, a supplied tracking number selects automatic detection. With neither a carrier nor a tracking number the default diagnostic is FedEx. Use `--config-path` to specify a single profile explicitly.
 
-## Carrier auto-detection
+## Read the report
 
-```bash
-tday doctor --carrier auto --tracking-number 1Z999AA10123456784 --json | jq
-```
+| Key | Meaning |
+| --- | --- |
+| `doctor_version` | `2`. |
+| `recognition` | Full offline result for the supplied scan, or null when there was no scan. |
+| `carrier.requested`, `detected`, `effective` | The command's selection, the unique detected carrier if present, and the carrier actually chosen for diagnostics. |
+| `config` | Configuration source, path, key presence and validity when examined. |
+| `network` | Whether network operations were requested and implemented, and any results of OAuth or tracking. |
+| `tracking` | Supplied number and normalized observations when the lookup succeeds. |
 
-Look at:
-- `.carrier.detected`
-- `.carrier.effective`
+Explicit UPS/USPS diagnostics can inspect their existing configuration fields. Live lookup coverage in 1.0.0 is FedEx only. For an aggregate configuration report, use `tday doctor --all --no-network --json`. The aggregate includes per-carrier exit codes under `summary.by_carrier`. With a scan, it attaches that scan only to the uniquely matched carrier's diagnostic. A single `--config-path` is incompatible with `--all`.
 
----
+| Doctor exit code | Meaning |
+| --- | --- |
+| 0 | The selected checks completed successfully. |
+| 2 | Carrier unresolved, diagnostic unavailable, configuration incomplete or lookup skipped. |
+| 3 | FedEx authentication failed. |
+| 4 | FedEx tracking failed after selection. |
 
-## Aggregate all carriers: `doctor --all`
-
-`--all` runs the doctor flow for **fedex + ups + usps** and emits one aggregated JSON object.
-
-```bash
-tday doctor --all --env prod --json | jq
-```
-
-Example (shape only; values redacted/truncated):
-
-```json
-{
-  "doctor_version": 1,
-  "mode": "all",
-  "env": "prod",
-  "tracking_number": "395579987149",
-  "carriers": {
-    "fedex": { "doctor_version": 1, "carrier": { "effective": "fedex" }, "config": { "valid": true }, "network": { "oauth": { "ok": true } } },
-    "ups":   { "doctor_version": 1, "carrier": { "effective": "ups" },   "config": { "valid": false }, "network": { "implemented": false } },
-    "usps":  { "doctor_version": 1, "carrier": { "effective": "usps" },  "config": { "valid": false }, "network": { "implemented": false } }
-  },
-  "summary": {
-    "rc": 2,
-    "by_carrier": { "fedex": 0, "ups": 2, "usps": 2 },
-    "config_valid": { "fedex": true, "ups": false, "usps": false }
-  }
-}
-```
-
-### Exit code behavior in `--all` mode
-
-Overall exit code is the most severe across carriers:
-- `4` if any carrier reports a track failure (FedEx only today)
-- `3` if any carrier reports an OAuth failure (FedEx only today)
-- `2` if any carrier has missing/invalid config
-- `0` only if all carriers are OK
-
+The aggregate returns the highest-priority exit code across its reports. For the separate `tday track` exit codes and migration notes, see the [CLI guide](https://github.com/Daylily-Informatics/daylily-carrier-tracking/blob/1.0.0/README.md#cli).

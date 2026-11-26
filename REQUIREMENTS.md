@@ -1,151 +1,68 @@
-# REQUIREMENTS — daylily-carrier-tracking
+# Daylily Carrier Tracking 1.0 — Python API
 
-Implementation contract for the unified multi-carrier tracking library + CLI.
+Install `daylily-carrier-tracking==1.0.0` and import from `daylily_carrier_tracking`. Python 3.10 or later is supported. [Quickstart](https://github.com/Daylily-Informatics/daylily-carrier-tracking/blob/1.0.0/README.md) · [Migration from 0.5.1](https://github.com/Daylily-Informatics/daylily-carrier-tracking/blob/1.0.0/docs/migration-1.0.md)
 
-## Goals
-- One Python package: `daylily_carrier_tracking`
-- One CLI entrypoint: `tday`
-- Input: a single tracking number (+ optional explicit carrier)
-- Output: **normalized ops-meta** (stable schema) + optional **raw** carrier payload
+## Offline recognition
 
-FedEx is implemented. UPS + USPS are scaffolded and are the next implementations.
+```python
+recognize_tracking_number(scan: str) -> RecognitionResult
+```
 
-## Non-goals (for now)
-- No persistence layer (DB/cache service).
-- No bulk tracking (single tracking number per call/CLI invocation).
-- No attempt to fully normalize event/scan history across carriers (raw keeps fidelity).
-- No paid aggregator integrations unless explicitly added later.
+The function evaluates the complete barcode against a packaged format catalog and applies the check-digit rules defined for matching formats. It takes a string, including a scanned full label or hand-entered tracking number. It makes no network request and needs no configuration. Passing a non-string raises `TypeError`.
 
-## Compatibility / constraints
-- Python: **3.10+**
-- Keep deps minimal: stdlib + existing deps (`requests`, `yaml_config_day`).
-- Tests must not do real network calls (mock `requests`).
-- Carrier auth/access patterns will change; isolate auth + HTTP per-carrier to minimize blast radius.
+| Public type | Fields |
+| --- | --- |
+| `RecognitionResult` | `scan: str` preserves the original input. `status` is `identified`, `ambiguous` or `unknown`. `candidates` is a tuple of distinct `CarrierCandidate` objects sorted by carrier ID. |
+| `CarrierCandidate` | `carrier_id: str` is the machine identifier. `display_name: str` is the operator label. `tracking_number` is the query string for that carrier, or `None` when it cannot be determined. |
 
-## Public API requirements
-All carriers must return the same shape from `.track(...)`:
+Both types are frozen dataclasses. Use `dataclasses.asdict(result)` and `json.dumps(...)` for a JSON representation; a tuple becomes a JSON array. Store the original `scan` when exact preservation matters. Queries for recognized formats can use uppercase characters, omit presentation whitespace and scanner headers, or contain an extracted field from the full label. Treat tracking numbers as strings throughout.
 
-- `carrier`: `"fedex" | "ups" | "usps"`
-- `tracking_number`: `str`
-- `source`: `dict`
-  - `api`: string identifier (ex: `"fedex.track.v1"`)
-  - `endpoint`: URL used
-  - `timestamp_utc`: ISO-8601 UTC timestamp
-- `ops_meta`: dict (mandatory keys below; always present)
-- `raw`: optional carrier response JSON (present when `include_raw=True`)
+- **Identified** means exactly one carrier has identifying format evidence. A receiving form may preselect it and allow override.
+- **Ambiguous** means more than one carrier is plausible, or the evidence comes only from a nonexclusive format. A global postal S10 code can suggest the issuing postal operator. A GS1 SSCC can suggest a container-label format. Neither establishes the delivery carrier. A bare 14-digit DHL format match alone is also ambiguous.
+- **Unknown** means there is no supported match. Empty or unrecognized strings return an empty candidate tuple and preserve their original value.
 
-### ops-meta schema (mandatory)
-`ops_meta` must always include these keys (even when unknown):
-- `Pickup_dt`
-- `Delivery_dt`
-- `Tender_dt`
-- `Ship_dt`
-- `Transit_Time_sec`
-- `Delivery_Status`
-- `Origin_state`
-- `Destination_state`
-- `Destination_city`
-- `Origin_city`
-- `Delivery_weekday`
-- `Ship_weekday`
-- `Origin_state_alt`
-- `Destination_state_alt`
+### Catalog and query numbers
 
-Defaults / missing conventions:
-- Use `default_ops_meta()` as the baseline.
-- Unknown string: `"na"` or empty string (match existing FedEx behavior).
-- Unknown numeric: `-1`.
+The distribution bundles the courier definitions and MIT license from [tracking_number_data v2.0.0](https://github.com/jkeen/tracking_number_data/tree/v2.0.0). They are loaded locally. Coverage includes Amazon, Canada Post, Canpar, DHL, DPD, FedEx, GOFO, Landmark Global, LaserShip, Old Dominion, OnTrac, Purolator, Spee-Dee, UPS, USPS, Yodel and YunExpress, plus international S10 postal labels. S10 issuer hints can use a country-specific postal ID. A catalog match describes a format; it does not confirm shipment or delivery.
 
-### Error handling contract
-- NOTFOUND / invalid tracking number: must **not crash**.
-  - Return default ops-meta.
-  - Include enough detail in `raw` (when available) to debug.
-- Unimplemented carriers: library raises `NotImplementedError`; CLI exits **2**.
-- Auth/network errors: raise an informative exception in library (preferred); CLI prints to stderr + non-zero exit.
+The matcher can extract the FedEx query number from ASTRA and supported long Ground/Express labels, remove supported USPS routing ZIP fields, and extract the parcel number from a DPD 28-character label. For example, FedEx ASTRA label `32971514560102447849175802862014` yields query number `784917580286`. Leading zeros within an identifier remain significant. Matching operates on a working copy, with Code 128/GS1-128 `]C0` and `]C1` scanner prefixes and ASCII presentation spacing recognized. Unknown input remains available verbatim.
 
-## CLI requirements
-Single console script: `tday`.
+## Unified lookup
 
-Global flags:
-- `--pretty`: pretty-print JSON.
+```python
+UnifiedTracker(fedex_config_proj_name="fedex", fedex_config_proj_env="prod",
+               fedex_config=None, *, fedex_enabled=None)
+tracker.track(scan, carrier="auto", include_raw=True, *, api_preference="track")
+tracker.track_ops_meta(scan, carrier="auto", *, api_preference="track")
+```
 
-Subcommands (current contract):
-- `tday fedex <TN> [--api-preference auto|track|ship] [--no-raw]`
-- `tday track <TN> [--carrier auto|fedex|ups|usps] [--no-raw]`
-- `tday ups <TN> [--no-raw]` (until implemented: exit 2)
-- `tday usps <TN> [--no-raw]` (until implemented: exit 2)
+A default instance has live access disabled. Passing a configuration mapping enables FedEx; an explicit `fedex_enabled=False` overrides that choice. To opt into the configured project/environment file, pass `fedex_enabled=True`. The profile is loaded lazily when a FedEx lookup is applicable.
 
-Output:
-- JSON to stdout.
-- Errors to stderr.
+Use `carrier="auto"` for an identified candidate, `carrier="unknown"` to retain an unknown selection, or pass a carrier ID to honor an operator’s choice. For a recognized label the selected carrier's decoded query number is used when available. A manual FedEx choice on an otherwise unknown scan can use the supplied tracking number. Caller input errors such as a non-string scan, invalid carrier argument or unsupported endpoint selection are programming errors.
 
-## Configuration & secrets
-### Primary mechanism: centralized YAML config
-Trackers should load credentials from `~/.config/daylily-carrier-tracking/<proj>_<env>.yaml` when `config` is not provided.
+| Outcome | Contents and interpretation |
+| --- | --- |
+| `succeeded` | FedEx returned a usable single-package result. `carrier`, `tracking_number`, `message` and `reason=None` accompany `ops_meta`, `source` and optionally `raw`. |
+| `not_attempted` | The library skipped the lookup. Reasons are `carrier_unknown`, `carrier_ambiguous`, `lookup_unsupported`, `lookup_disabled`, `configuration_error`, `empty_tracking_number` and `query_number_unavailable`. |
+| `failed` | A provider operation failed. Reasons are `authentication_failed`, `not_found`, `provider_error`, `provider_timeout`, `provider_unreachable` and `invalid_response`. The message is suitable for an operator-facing note. |
 
-Backward compatibility:
-- If the centralized file is missing, trackers may fall back to `yaml_config_day`'s legacy behavior.
+Each outcome carries `status`, `reason`, `message`, `carrier` and `tracking_number`. The carrier can be `None` for unresolved input. A skipped lookup or failure has no shipment observations. `track_ops_meta()` returns the same outcome envelope and omits the raw carrier payload. A consumer that allows receiving to continue after a provider failure can persist its Package independently and record a note from the failed outcome.
 
-FedEx current config keys (required/used by implementation):
-- `client_id`
-- `client_secret`
-- `oauth_url` **or** `api_url` (either name accepted)
-Optional overrides:
-- `track_url`
-- `ship_track_url`
+### Successful FedEx observations
 
-File convention:
-- `~/.config/daylily-carrier-tracking/<proj>_<env>.yaml` (example: `~/.config/daylily-carrier-tracking/fedex_prod.yaml`)
+`source` identifies the selected API, URL, HTTP status and elapsed milliseconds. With `include_raw=True`, `raw` contains the original FedEx response, including scan events when supplied. `ops_meta` uses the package’s existing field names:
 
-### Override mechanism: `config: dict`
-All trackers must accept `config: dict | None` so callers/tests can bypass `yaml_config_day`.
+| Group | Keys |
+| --- | --- |
+| Carrier and status | `Carrier`, `Delivery_Status` |
+| Times | `Pickup_dt`, `Delivery_dt`, `Tender_dt`, `Ship_dt`, `Transit_Time_sec`, `Delivery_weekday`, `Ship_weekday` |
+| Locations and legacy fields | `Origin_state`, `Origin_city`, `Destination_state`, `Destination_city`, `Origin_state_alt`, `Destination_state_alt` |
 
-## Carrier-specific implementation requirements
+Missing legacy metadata fields can contain empty strings, `na` or a numeric sentinel. Determine lookup success from the outcome status.
 
-### FedEx (implemented)
-Must continue to support:
-- OAuth2 client-credentials
-- Token caching + proactive refresh
-- Track API v1 + optional Ship fallback
-- `api_preference`: `auto | track | ship` with `auto` doing Track then Ship on NOTFOUND (if configured)
+### Direct FedEx interfaces
 
-### UPS (to implement)
-Create `daylily_carrier_tracking/ups_tracker.py` with an `UpsTracker` analogous to `FedexTracker`.
-
-Requirements:
-- OAuth2 client-credentials
-- Cached token with expiry; refresh before expiry
-- Tracking endpoint + version captured in `source.api`
-- Normalization best-effort into ops-meta
-
-Deliverables:
-- UPS routing in `UnifiedTracker`
-- CLI parity (`ups` subcommand + `track --carrier ups`)
-- Unit tests (mocked HTTP): happy path, NOTFOUND defaults, token refresh path
-
-### USPS (to implement)
-Create `daylily_carrier_tracking/usps_tracker.py` with a `UspsTracker` analogous to `FedexTracker`.
-
-Auth decision is variable (legacy Web Tools vs newer APIs). Requirements regardless:
-- Isolate auth mechanism behind a provider object
-- Normalize best-effort into ops-meta
-- Tests (mocked HTTP): happy path, NOTFOUND defaults, auth failure
-
-## Internal architecture requirements
-- Keep each carrier in its own module:
-  - token provider (if applicable)
-  - request builder + HTTP wrapper
-  - response normalizer
-- Centralize per-carrier NOTFOUND detection in one function.
-- Python 3.10 datetime parsing must handle trailing `Z` (convert to `+00:00` before `fromisoformat`).
-
-## Testing
-- `unittest` + `unittest.mock`
-- No real network calls
-- Run: `python -m unittest discover -s tests`
-
-## Definition of Done (per carrier)
-- `UnifiedTracker.track(..., carrier="<carrier>")` works under mocked tests
-- CLI prints valid JSON with the normalized shape
-- NOTFOUND returns defaults (no crash)
-- Token refresh is covered by tests (where applicable)
+- `FedexTracker(config=...)` accepts the explicit configuration used by existing integrations. It also accepts the existing project/environment constructor parameters. Either `oauth_url` or `api_url` names the OAuth endpoint; supplying both with conflicting values is a configuration error. Provide `client_id`, `client_secret` and the tracking endpoint for the chosen route. `api_preference="track"` uses `track_url`; explicit `"ship"` uses `ship_track_url`.
+- `auth_token()` obtains a token. `track_raw(number, api_preference="track")` returns the response mapping and request metadata; a successful HTTP response can contain a carrier-level error. `track()` interprets carrier errors and returns FedEx data on success. The direct `track_ops_meta()` returns only normalized metadata on success.
+- Direct callers can catch `FedexConfigurationError` or `FedexLookupError`; the latter exposes a stable `reason`. `UnifiedTracker` translates these into the outcomes above.
+- `default_ops_meta()` constructs the legacy blank metadata mapping. `normalize_fedex_track_ops_meta(raw)` remains available for callers that already own the FedEx transport. These helpers do not perform a lookup.

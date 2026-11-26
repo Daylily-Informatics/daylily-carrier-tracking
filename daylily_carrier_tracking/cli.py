@@ -4,247 +4,16 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import asdict
 from getpass import getpass
+from importlib.resources import files
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from daylily_carrier_tracking.config import config_path, load_yaml_mapping, write_yaml_mapping
 from daylily_carrier_tracking.fedex_tracker import FedexTracker
-from daylily_carrier_tracking.unified_tracker import UnifiedTracker, detect_carrier
-
-
-# Keep completion scripts available from the installed console-script entrypoint
-# (i.e. without needing a repo checkout).
-_BASH_COMPLETION_FALLBACK = """# Bash tab completion for `tday`.
-#
-# Usage (one-shot):
-#   source <(tday completion bash)
-#
-# Usage (repo checkout):
-#   source /path/to/daylily-carrier-tracking/completions/tday.bash
-#
-# Notes:
-# - This registers completion for the command name `tday` only.
-# - It does NOT register completion for `./tday` or `tracking_day`.
-
-_tday_complete() {
-  local cur prev
-  cur="${COMP_WORDS[COMP_CWORD]}"
-  prev=""
-  if [ "$COMP_CWORD" -ge 1 ]; then
-    prev="${COMP_WORDS[COMP_CWORD-1]}"
-  fi
-
-  local subcmds="test configure track doctor completion fedex ups usps"
-  local global_opts="--pretty --no-color -h --help"
-
-  # Value completion for flags that take an argument.
-  case "$prev" in
-    --carrier)
-      COMPREPLY=( $(compgen -W "auto fedex ups usps" -- "$cur") )
-      return 0
-      ;;
-    --api-preference)
-      COMPREPLY=( $(compgen -W "auto track ship" -- "$cur") )
-      return 0
-      ;;
-    --env)
-      COMPREPLY=( $(compgen -W "prod test sandbox dev" -- "$cur") )
-      return 0
-      ;;
-    --path|--config-path)
-      COMPREPLY=( $(compgen -f -- "$cur") )
-      return 0
-      ;;
-  esac
-
-  # Find the first subcommand (global flags may appear before/after).
-  local cmd=""
-  local i
-  for ((i=1; i<${#COMP_WORDS[@]}; i++)); do
-    case "${COMP_WORDS[i]}" in
-      test|configure|track|doctor|completion|fedex|ups|usps)
-        cmd="${COMP_WORDS[i]}"
-        break
-        ;;
-    esac
-  done
-
-  if [ -z "$cmd" ]; then
-    if [[ "$cur" == -* ]]; then
-      COMPREPLY=( $(compgen -W "$global_opts" -- "$cur") )
-    else
-      COMPREPLY=( $(compgen -W "$subcmds" -- "$cur") )
-    fi
-    return 0
-  fi
-
-  # `tday configure <carrier>` positional completion.
-  if [ "$cmd" = "configure" ]; then
-    local cmd_idx=-1
-    for ((i=1; i<${#COMP_WORDS[@]}; i++)); do
-      if [ "${COMP_WORDS[i]}" = "configure" ]; then
-        cmd_idx=$i
-        break
-      fi
-    done
-    if [ "$cmd_idx" -ge 0 ] && [ "$COMP_CWORD" -eq $((cmd_idx + 1)) ]; then
-      COMPREPLY=( $(compgen -W "fedex ups usps" -- "$cur") )
-      return 0
-    fi
-  fi
-
-  # `tday completion <shell>` positional completion.
-  if [ "$cmd" = "completion" ]; then
-    local cmd_idx=-1
-    for ((i=1; i<${#COMP_WORDS[@]}; i++)); do
-      if [ "${COMP_WORDS[i]}" = "completion" ]; then
-        cmd_idx=$i
-        break
-      fi
-    done
-    if [ "$cmd_idx" -ge 0 ] && [ "$COMP_CWORD" -eq $((cmd_idx + 1)) ]; then
-      COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
-      return 0
-    fi
-  fi
-
-  local opts=""
-  case "$cmd" in
-    test)
-      opts="$global_opts --test-fedex --test-ups --test-usps"
-      ;;
-    configure)
-      opts="$global_opts --env --path --skip-validate"
-      ;;
-    track)
-      opts="$global_opts --carrier --no-raw --api-preference"
-      ;;
-    doctor)
-      opts="$global_opts --all --carrier --env --config-path --no-network --tracking-number --json"
-      ;;
-    completion)
-      opts="$global_opts"
-      ;;
-    fedex)
-      opts="$global_opts --api-preference --no-raw"
-      ;;
-    ups|usps)
-      opts="$global_opts --no-raw"
-      ;;
-  esac
-
-  if [[ "$cur" == -* ]]; then
-    COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
-  else
-    COMPREPLY=()
-  fi
-  return 0
-}
-
-complete -F _tday_complete tday
-"""
-
-
-_ZSH_COMPLETION_FALLBACK = """#compdef tday
-
-# Zsh tab completion for `tday`.
-#
-# One-shot:
-#   source <(tday completion zsh)
-#
-# Install (example):
-#   mkdir -p ~/.zsh/completions
-#   tday completion zsh > ~/.zsh/completions/_tday
-#   # then ensure ~/.zsh/completions is in $fpath and compinit is enabled
-
-_tday() {
-  local -a subcmds global_opts
-  subcmds=(test configure track doctor completion fedex ups usps)
-  global_opts=(--pretty --no-color -h --help)
-
-  # Find the first subcommand (global flags may appear before/after).
-  local cmd=""
-  local w
-  for w in $words; do
-    if (( ${subcmds[(I)$w]} )); then
-      cmd="$w"
-      break
-    fi
-  done
-
-  local prev=${words[CURRENT-1]}
-  case $prev in
-    --carrier)
-      _values 'carrier' auto fedex ups usps
-      return
-      ;;
-    --api-preference)
-      _values 'api preference' auto track ship
-      return
-      ;;
-    --env)
-      _values 'env' prod test sandbox dev
-      return
-      ;;
-    --path|--config-path)
-      _files
-      return
-      ;;
-  esac
-
-  if [[ -z "$cmd" ]]; then
-    if [[ ${words[CURRENT]} == -* ]]; then
-      _values 'options' $global_opts
-    else
-      _values 'command' $subcmds
-    fi
-    return
-  fi
-
-  local cmd_i=${words[(i)$cmd]}
-  if [[ $cmd == configure && $CURRENT -eq $((cmd_i + 1)) ]]; then
-    _values 'carrier' fedex ups usps
-    return
-  fi
-
-  if [[ $cmd == completion && $CURRENT -eq $((cmd_i + 1)) ]]; then
-    _values 'shell' bash zsh
-    return
-  fi
-
-  local -a opts
-  case $cmd in
-    test)
-      opts=($global_opts --test-fedex --test-ups --test-usps)
-      ;;
-    configure)
-      opts=($global_opts --env --path --skip-validate)
-      ;;
-    track)
-      opts=($global_opts --carrier --no-raw --api-preference)
-      ;;
-    doctor)
-      opts=($global_opts --all --carrier --env --config-path --no-network --tracking-number --json)
-      ;;
-    completion)
-      opts=($global_opts)
-      ;;
-    fedex)
-      opts=($global_opts --api-preference --no-raw)
-      ;;
-    ups|usps)
-      opts=($global_opts --no-raw)
-      ;;
-  esac
-
-  if [[ ${words[CURRENT]} == -* ]]; then
-    _values 'options' $opts
-  fi
-}
-
-compdef _tday tday
-"""
+from daylily_carrier_tracking.recognition import recognize_tracking_number
+from daylily_carrier_tracking.unified_tracker import UnifiedTracker
 
 
 def _print_json(obj: Dict[str, Any], pretty: bool) -> None:
@@ -336,13 +105,10 @@ def _run_subprocess(cmd: Sequence[str], cwd: Optional[Path] = None) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    # Do not hardcode `prog` so installed entrypoints (tday) and repo wrappers
-    # (tracking_day/tday) show the correct command name in --help output.
+    # Use argparse's program name for the console script and checkout wrapper.
     p = argparse.ArgumentParser(
         description=(
-            "Unified multi-carrier tracking CLI. "
-            "Commands: test, configure, track. "
-            "FedEx is implemented; UPS/USPS are scaffolded."
+            "Recognize shipment tracking barcodes offline and look up FedEx shipments."
         ),
     )
 
@@ -402,39 +168,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cfg.add_argument("--skip-validate", action="store_true", help="Do not attempt a live credential validation call")
 
-    track = sub.add_parser("track", parents=[common, json_out], help="Live tracking call (prints JSON result)")
-    track.add_argument("tracking_number", help="Tracking number")
+    recognize = sub.add_parser("recognize", parents=[common, json_out], help="Recognize a scanned tracking number offline (JSON)")
+    recognize.add_argument("scan", help="Tracking number or decoded shipping barcode")
+
+    track = sub.add_parser("track", parents=[common, json_out], help="Request live tracking from a configured carrier (JSON)")
+    track.add_argument("tracking_number", help="Tracking number or decoded shipping barcode")
     track.add_argument(
         "--carrier",
         default="auto",
-        choices=["auto", "fedex", "ups", "usps"],
-        help="Carrier selection (default: auto via detect_carrier())",
+        metavar="CARRIER",
+        help="Carrier ID selected by the operator, or auto to use a unique match (default)",
     )
     track.add_argument("--no-raw", action="store_true", help="Omit raw carrier payload from JSON output")
     track.add_argument(
         "--api-preference",
-        default="auto",
-        choices=["auto", "track", "ship"],
-        help="FedEx only: route to track/ship endpoint (default: auto)",
+        default="track",
+        choices=["track", "ship"],
+        help="FedEx endpoint to query (default: track)",
     )
-
-    # Legacy compatibility (do not duplicate logic; main() maps these to track).
-    fedex = sub.add_parser(
-        "fedex",
-        parents=[common, json_out],
-        help="(deprecated) Alias of: track --carrier fedex",
-    )
-    fedex.add_argument("tracking_number")
-    fedex.add_argument("--api-preference", default="auto", choices=["auto", "track", "ship"], help="Route to track/ship endpoint")
-    fedex.add_argument("--no-raw", action="store_true", help="Omit raw response")
-
-    ups = sub.add_parser("ups", parents=[common, json_out], help="(deprecated) Alias of: track --carrier ups")
-    ups.add_argument("tracking_number")
-    ups.add_argument("--no-raw", action="store_true", help="Omit raw response")
-
-    usps = sub.add_parser("usps", parents=[common, json_out], help="(deprecated) Alias of: track --carrier usps")
-    usps.add_argument("tracking_number")
-    usps.add_argument("--no-raw", action="store_true", help="Omit raw response")
 
     doctor = sub.add_parser(
         "doctor",
@@ -448,9 +199,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor.add_argument(
         "--carrier",
-        default="fedex",
-        choices=["auto", "fedex", "ups", "usps"],
-        help="Carrier to diagnose (default: fedex)",
+        metavar="CARRIER",
+        help="Carrier to diagnose (default: auto with --tracking-number, otherwise fedex)",
     )
     doctor.add_argument("--env", default="prod", help="Config environment name (default: prod)")
     doctor.add_argument(
@@ -486,29 +236,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_completion(args: argparse.Namespace) -> int:
-    shell = str(getattr(args, "shell", "") or "").lower()
-    if shell not in {"bash", "zsh"}:
-        # Argparse should prevent this in normal usage; keep a safe fallback.
-        sys.stdout.write(json.dumps({"error": f"unsupported shell: {shell}"}))
-        sys.stdout.write("\n")
-        return 2
-
-    # Prefer repo checkout scripts when present (keeps a single source of truth
-    # during development), but always have an embedded fallback for installed use.
-    repo_root = Path(__file__).resolve().parents[1]
-    if shell == "bash":
-        p = repo_root / "completions" / "tday.bash"
-        fallback = _BASH_COMPLETION_FALLBACK
-    else:
-        p = repo_root / "completions" / "_tday"
-        fallback = _ZSH_COMPLETION_FALLBACK
-
-    try:
-        txt = p.read_text(encoding="utf-8")
-    except Exception:
-        txt = fallback
-
-    sys.stdout.write(txt)
+    filename = {"bash": "tday.bash", "zsh": "_tday"}[args.shell]
+    asset = files("daylily_carrier_tracking").joinpath("completions").joinpath(filename)
+    sys.stdout.write(asset.read_text(encoding="utf-8"))
     return 0
 
 
@@ -542,12 +272,14 @@ def _doctor_one(
     emit_human: bool,
 ) -> Tuple[Dict[str, Any], int]:
     tn = tracking_number
-    detected = detect_carrier(str(tn)) if tn else None
+    recognition = recognize_tracking_number(tn) if tn is not None else None
+    detected = recognition.candidates[0].carrier_id if recognition and recognition.status == "identified" else None
     carrier_effective = detected if carrier_requested == "auto" else carrier_requested
 
     final_rc = 0
     report: Dict[str, Any] = {
-        "doctor_version": 1,
+        "doctor_version": 2,
+        "recognition": asdict(recognition) if recognition is not None else None,
         "carrier": {
             "requested": carrier_requested,
             "detected": detected,
@@ -579,6 +311,9 @@ def _doctor_one(
             _eprint(msg)
 
     _human(_note(f"Doctor: carrier={carrier_effective} env={env}", color))
+    if recognition and recognition.candidates:
+        names = ", ".join(candidate.display_name for candidate in recognition.candidates)
+        _human(_note(f"Recognition ({recognition.status}): {names}", color))
     _human(_note(f"Python: {sys.executable} ({sys.version.split()[0]})", color))
     try:
         import daylily_carrier_tracking as pkg  # noqa: F401
@@ -592,6 +327,17 @@ def _doctor_one(
     if carrier_requested == "auto" and not tn:
         report["error"] = "carrier=auto requires --tracking-number"
         _human(_err("ERROR: carrier=auto requires --tracking-number", color))
+        return report, 2
+
+    if carrier_effective is None:
+        report["error"] = f"Carrier {recognition.status}; select a carrier to run diagnostics."
+        report["network"]["note"] = "No carrier selected."
+        _human(_warn(report["error"], color))
+        return report, 2
+
+    if carrier_effective not in {"fedex", "ups", "usps"} or (carrier_requested == "auto" and carrier_effective != "fedex"):
+        report["network"]["note"] = "This carrier has no live lookup provider."
+        _human(_warn(report["network"]["note"], color))
         return report, 2
 
     if config_path_override:
@@ -613,8 +359,9 @@ def _doctor_one(
             report["config"]["keys"] = sorted(list(cfg.keys()))
             _human(_note(f"Config keys: {report['config']['keys']}", color))
         except Exception as e:
-            report["config"]["load_error"] = f"{type(e).__name__}: {e}"
-            _human(_err(f"ERROR: Failed to load YAML: {type(e).__name__}: {e}", color))
+            message = f"Could not load carrier YAML ({type(e).__name__})."
+            report["config"]["load_error"] = message
+            _human(_err(message, color))
             return report, 2
     else:
         # For FedEx we still treat missing config as an error; for UPS/USPS we
@@ -623,15 +370,13 @@ def _doctor_one(
             report["config"]["missing_note"] = "Expected: ~/.config/daylily-carrier-tracking/<carrier>_<env>.yaml"
             _human(_err("ERROR: Config file does not exist.", color))
             _human(_note("Expected: ~/.config/daylily-carrier-tracking/<carrier>_<env>.yaml", color))
-            _human(_note("(For backward compatibility, FedEx tracker can also fall back to yaml_config_day.)", color))
             return report, 2
 
     def _present_len(k: str) -> str:
         v = cfg.get(k)
-        if v is None:
+        if not isinstance(v, str) or not v.strip():
             return "missing"
-        s = str(v)
-        return f"present(len={len(s)})"
+        return f"present(len={len(v)})"
 
     # Carrier-specific config validation
     if carrier_effective == "fedex":
@@ -642,13 +387,16 @@ def _doctor_one(
             "client_id": _present_len("client_id"),
             "client_secret": _present_len("client_secret"),
         }
+        if tn is not None:
+            report["config"]["required"].append("track_url")
+            report["config"]["presence"]["track_url"] = "present" if cfg.get("track_url") else "missing"
         report["config"]["oauth_url"] = oauth_url
 
         _human(_note(f"oauth_url/api_url: {oauth_url or '<missing>'}", color))
         _human(_note(f"client_id: {report['config']['presence']['client_id']}", color))
         _human(_note(f"client_secret: {report['config']['presence']['client_secret']}", color))
 
-        if not oauth_url or not cfg.get("client_id") or not cfg.get("client_secret"):
+        if "missing" in report["config"]["presence"].values():
             report["config"]["valid"] = False
             report["error"] = "Missing required FedEx config keys"
             _human(_err("ERROR: Missing required FedEx config keys.", color))
@@ -672,63 +420,41 @@ def _doctor_one(
         _human(_err("ERROR: Unhandled carrier", color))
         return report, 2
 
-    # Optional: always include a normalized response blob when tracking number is provided.
-    if tn:
-        try:
-            ut = UnifiedTracker(fedex_config_proj_env=env, fedex_config=cfg if carrier_effective == "fedex" else None)
-            ops = ut.track_ops_meta(str(tn), carrier=carrier_effective)
-            report["tracking"]["normalized"] = ops
-        except Exception as e:
-            report["tracking"]["normalized_error"] = f"{type(e).__name__}: {e}"
+    if carrier_effective != "fedex":
+        return report, final_rc
+    if no_network:
+        report["network"]["note"] = "skipped per --no-network"
+        _human(_note("Network checks skipped.", color))
+        return report, 0
 
-    # Network checks (FedEx only)
-    if carrier_effective == "fedex":
-        if no_network:
-            report["network"]["note"] = "skipped per --no-network"
-            _human(_warn("Skipping network checks (per --no-network).", color))
+    if tn is not None:
+        tracker = UnifiedTracker(fedex_config=cfg)
+        outcome = tracker.track(tn, carrier=carrier_requested, include_raw=False)
+        ok = outcome["status"] == "succeeded"
+        report["network"]["track"] = {"ok": ok, "response": outcome}
+        if ok:
+            report["tracking"]["normalized"] = outcome["ops_meta"]
+            report["network"]["oauth"] = {"ok": True}
+            _human(_ok("FedEx tracking succeeded.", color))
             return report, 0
-
-        report["network"]["implemented"] = True
-        _human(_note("Network check: requesting OAuth token...", color))
-        try:
-            ft = FedexTracker(config=cfg)
-            token = ft.auth_token()
-            report["network"]["oauth"] = {"ok": True, "token_len": len(token)}
-            _human(_ok(f"OAuth OK (token acquired; length={len(token)}).", color))
-        except Exception as e:
-            status = None
-            body = None
-            try:
-                resp = getattr(e, "response", None)
-                status = getattr(resp, "status_code", None)
-                body = getattr(resp, "text", None)
-            except Exception:
-                pass
-            report["network"]["oauth"] = {
-                "ok": False,
-                "error": f"{type(e).__name__}: {e}",
-                "http_status": status,
-                "response_body": (body[:400] if body else None),
-            }
-            if status is not None:
-                _human(_err(f"OAuth FAILED: HTTP {status}", color))
-                if body:
-                    _human(_err(f"Response body (first 400 chars): {body[:400]}", color))
-            else:
-                _human(_err(f"OAuth FAILED: {type(e).__name__}: {e}", color))
+        _human(_err(outcome["message"], color))
+        if outcome["status"] == "not_attempted":
+            return report, 2
+        if outcome["reason"] == "authentication_failed":
+            report["network"]["oauth"] = {"ok": False, "error": outcome["message"]}
             return report, 3
+        return report, 4
 
-        if tn:
-            _human(_note(f"Network check: tracking {tn}...", color))
-            try:
-                out = ft.track(str(tn), api_preference="auto", include_raw=False)
-                report["network"]["track"] = {"ok": True, "response": out}
-                _human(_ok("Track OK.", color))
-            except Exception as e:
-                report["network"]["track"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-                _human(_err(f"Track FAILED: {type(e).__name__}: {e}", color))
-                return report, 4
-
+    _human(_note("Requesting a FedEx OAuth token...", color))
+    try:
+        FedexTracker(config=cfg).auth_token()
+    except Exception:
+        message = "FedEx OAuth failed. Check the configured endpoint and credentials."
+        report["network"]["oauth"] = {"ok": False, "error": message}
+        _human(_err(message, color))
+        return report, 3
+    report["network"]["oauth"] = {"ok": True}
+    _human(_ok("FedEx OAuth succeeded.", color))
     return report, final_rc
 
 
@@ -738,9 +464,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
     all_mode = bool(getattr(args, "all", False))
 
-    carrier_requested = str(getattr(args, "carrier", "fedex") or "fedex").lower()
     env = str(getattr(args, "env", "prod") or "prod").lower()
     tn = getattr(args, "tracking_number", None)
+    carrier_requested = (args.carrier or ("auto" if tn is not None else "fedex")).lower()
     no_network = bool(getattr(args, "no_network", False))
     cfg_path = getattr(args, "config_path", None)
 
@@ -748,7 +474,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         # Aggregated mode is JSON-only (so it can be piped to jq / attached to tickets).
         if cfg_path:
             out = {
-                "doctor_version": 1,
+                "doctor_version": 2,
                 "mode": "all",
                 "env": env,
                 "tracking_number": str(tn) if tn else None,
@@ -757,6 +483,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             print(json.dumps(out, indent=2, sort_keys=True))
             return 2
 
+        recognition = recognize_tracking_number(tn) if tn is not None else None
+        detected = recognition.candidates[0].carrier_id if recognition and recognition.status == "identified" else None
         carriers = ["fedex", "ups", "usps"]
         per: Dict[str, Any] = {}
         rcs: Dict[str, int] = {}
@@ -764,7 +492,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             rep, rc = _doctor_one(
                 carrier_requested=c,
                 env=env,
-                tracking_number=str(tn) if tn else None,
+                tracking_number=tn if c == detected else None,
                 config_path_override=None,
                 no_network=no_network,
                 json_mode=True,
@@ -776,10 +504,11 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
         overall = _merge_doctor_exit_codes(rcs.values())
         out = {
-            "doctor_version": 1,
+            "doctor_version": 2,
             "mode": "all",
             "env": env,
             "tracking_number": str(tn) if tn else None,
+            "recognition": asdict(recognition) if recognition is not None else None,
             "carriers": per,
             "summary": {
                 "rc": overall,
@@ -793,7 +522,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     report, rc = _doctor_one(
         carrier_requested=carrier_requested,
         env=env,
-        tracking_number=str(tn) if tn else None,
+        tracking_number=tn,
         config_path_override=str(cfg_path) if cfg_path else None,
         no_network=no_network,
         json_mode=json_mode,
@@ -871,7 +600,7 @@ def _cmd_configure_fedex(args: argparse.Namespace) -> int:
     client_id = _prompt("client_id", required=True)
     client_secret = _prompt("client_secret", secret=True, required=True)
     oauth_url = _prompt("oauth_url", default="https://apis.fedex.com/oauth/token", required=True)
-    track_url = _prompt("track_url (optional)", default="https://apis.fedex.com/track/v1/trackingnumbers", required=False)
+    track_url = _prompt("track_url", default="https://apis.fedex.com/track/v1/trackingnumbers", required=True)
     ship_track_url = _prompt("ship_track_url (optional)", default="", required=False)
 
     cfg: Dict[str, Any] = {
@@ -921,35 +650,17 @@ def _cmd_configure(args: argparse.Namespace) -> int:
 
 def _cmd_track(args: argparse.Namespace) -> int:
     color = _color_enabled(bool(getattr(args, "no_color", False)))
-    tn = str(args.tracking_number)
-    carrier = str(args.carrier).lower()
-    include_raw = not bool(args.no_raw)
-    api_preference = str(getattr(args, "api_preference", "auto")).lower()
-
-    resolved_carrier = carrier
-    if carrier == "auto":
-        resolved_carrier = detect_carrier(tn)
-        _eprint(_note(f"Auto-detected carrier: {resolved_carrier}", color))
-
-    try:
-        if resolved_carrier == "fedex":
-            ft = FedexTracker()
-            out = ft.track(tn, api_preference=api_preference, include_raw=include_raw)
-        else:
-            if api_preference != "auto":
-                _eprint(_warn("--api-preference is FedEx-only; ignoring for non-FedEx carriers.", color))
-            ut = UnifiedTracker()
-            out = ut.track(tn, carrier=resolved_carrier, include_raw=include_raw)
-
-        _eprint(_ok("Track call completed.", color))
-        _print_json(out, pretty=bool(args.pretty))
+    outcome = UnifiedTracker(fedex_enabled=True).track(
+        args.tracking_number,
+        carrier=args.carrier,
+        include_raw=not args.no_raw,
+        api_preference=args.api_preference,
+    )
+    _print_json(outcome, pretty=args.pretty)
+    if outcome["status"] == "succeeded":
         return 0
-    except NotImplementedError as e:
-        _eprint(_err(f"ERROR: {e}", color))
-        return 2
-    except Exception as e:
-        _eprint(_err(f"ERROR: {type(e).__name__}: {e}", color))
-        return 1
+    _eprint(_warn(outcome["message"], color))
+    return 2 if outcome["status"] == "not_attempted" else 1
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -959,21 +670,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_test(args)
     if args.cmd == "configure":
         return _cmd_configure(args)
+    if args.cmd == "recognize":
+        _print_json(asdict(recognize_tracking_number(args.scan)), pretty=args.pretty)
+        return 0
     if args.cmd == "track":
         return _cmd_track(args)
     if args.cmd == "doctor":
         return _cmd_doctor(args)
     if args.cmd == "completion":
         return _cmd_completion(args)
-
-    # Deprecated aliases (kept for backward compatibility).
-    if args.cmd in {"fedex", "ups", "usps"}:
-        args2 = argparse.Namespace(**vars(args))
-        args2.cmd = "track"
-        args2.carrier = args.cmd
-        if not hasattr(args2, "api_preference"):
-            args2.api_preference = "auto"
-        return _cmd_track(args2)
 
     color = _color_enabled(bool(getattr(args, "no_color", False)))
     _eprint(_err("ERROR: Unhandled command", color))

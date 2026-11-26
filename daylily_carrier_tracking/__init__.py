@@ -1,17 +1,23 @@
-"""daylily_carrier_tracking
+"""Offline carrier recognition and optional FedEx lookup."""
 
-Unified multi-carrier tracking.
-
-FedEx is implemented; UPS/USPS are scaffolded.
-"""
-
-from .fedex_tracker import FedexTracker, default_ops_meta, normalize_fedex_track_ops_meta  # noqa: F401
-from .unified_tracker import UnifiedTracker, detect_carrier  # noqa: F401
+from .fedex_tracker import (
+    FedexConfigurationError,
+    FedexLookupError,
+    FedexTracker,
+    default_ops_meta,
+    normalize_fedex_track_ops_meta,
+)
+from .recognition import CarrierCandidate, RecognitionResult, recognize_tracking_number
+from .unified_tracker import UnifiedTracker
 
 __all__ = [
-    "FedexTracker",
+    "CarrierCandidate",
+    "RecognitionResult",
+    "recognize_tracking_number",
     "UnifiedTracker",
-    "detect_carrier",
+    "FedexTracker",
+    "FedexConfigurationError",
+    "FedexLookupError",
     "default_ops_meta",
     "normalize_fedex_track_ops_meta",
 ]

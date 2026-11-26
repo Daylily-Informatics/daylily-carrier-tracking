@@ -10,7 +10,7 @@ LONG_DESCRIPTION = (HERE / "README.md").read_text(encoding="utf-8")
 setup(
     name="daylily_carrier_tracking",
     use_scm_version=True,
-    description="Unified multi-carrier tracking (FedEx implemented; UPS/USPS pending)",
+    description="Offline multi-carrier tracking number recognition and live FedEx tracking",
     long_description=LONG_DESCRIPTION,
     long_description_content_type="text/markdown",
     url="https://github.com/Daylily-Informatics/daylily-carrier-tracking",
@@ -28,14 +28,16 @@ setup(
     ],
     packages=find_packages(exclude=("tests", "tests.*")),
     include_package_data=True,
+    package_data={
+        "daylily_carrier_tracking": ["data/couriers/*.json", "data/LICENSE", "completions/*"],
+    },
     install_requires=[
         "requests",
-        "yaml_config_day",
+        "PyYAML",
     ],
     entry_points={
         "console_scripts": [
             "tday=daylily_carrier_tracking.cli:main",
-            "tracking_day=daylily_carrier_tracking.cli:main",  # deprecated alias
         ],
     },
 )

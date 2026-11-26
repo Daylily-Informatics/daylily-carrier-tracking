@@ -7,12 +7,48 @@ from pathlib import Path
 import json
 
 
-class _DummyUnified:
-    def track(self, *args, **kwargs):
-        raise NotImplementedError("Carrier 'usps' is not implemented yet.")
-
-
 class TestCli(unittest.TestCase):
+    def test_recognize_unknown_keeps_original_scan(self):
+        from daylily_carrier_tracking.cli import main
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = main(["recognize", "000-UnknownCourier", "--pretty"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue()), {
+            "scan": "000-UnknownCourier", "status": "unknown", "candidates": [],
+        })
+
+    def test_doctor_default_with_unknown_number_does_not_read_provider_config(self):
+        from daylily_carrier_tracking.cli import main
+
+        out = io.StringIO()
+        with patch("daylily_carrier_tracking.cli.config_path") as config, contextlib.redirect_stdout(out):
+            rc = main(["doctor", "--tracking-number", "000-UnknownCourier", "--json"])
+        config.assert_not_called()
+        self.assertEqual(rc, 2)
+        report = json.loads(out.getvalue())
+        self.assertIsNone(report["carrier"]["effective"])
+        self.assertEqual(report["recognition"]["status"], "unknown")
+
+    def test_doctor_no_network_with_scan_skips_all_provider_calls(self):
+        from daylily_carrier_tracking.cli import main
+
+        with tempfile.TemporaryDirectory() as td:
+            config = Path(td) / "fedex.yaml"
+            config.write_text("oauth_url: https://example.org/oauth\ntrack_url: https://example.org/track\n"
+                              "client_id: id\nclient_secret: example\n")
+            with (
+                patch("daylily_carrier_tracking.cli.FedexTracker") as direct,
+                patch("daylily_carrier_tracking.cli.UnifiedTracker") as lookup,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                rc = main(["doctor", "--carrier", "fedex", "--tracking-number", "000-UnknownCourier",
+                           "--config-path", str(config), "--no-network", "--json"])
+        self.assertEqual(rc, 0)
+        direct.assert_not_called()
+        lookup.assert_not_called()
+
     def test_build_parser_parses_track(self):
         from daylily_carrier_tracking.cli import build_parser
 
@@ -282,16 +318,14 @@ class TestCli(unittest.TestCase):
         self.assertIn("discover", called)
         self.assertIn("tests", called)
 
-    @patch("daylily_carrier_tracking.cli.UnifiedTracker", autospec=True)
-    def test_usps_command_returns_exit_2(self, UT):
+    def test_unsupported_explicit_carrier_returns_exit_2(self):
         from daylily_carrier_tracking.cli import main
 
-        UT.return_value = _DummyUnified()
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            rc = main(["usps", "9400...", "--no-raw"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = main(["track", "9400...", "--carrier", "usps", "--no-raw"])
         self.assertEqual(rc, 2)
-        self.assertIn("not implemented", buf.getvalue().lower())
+        self.assertEqual(json.loads(out.getvalue())["status"], "not_attempted")
 
     def test_unified_tracker_does_not_require_fedex_config_for_ups(self):
         # Regression: UnifiedTracker should not eagerly construct FedexTracker
@@ -301,8 +335,9 @@ class TestCli(unittest.TestCase):
         with patch("daylily_carrier_tracking.unified_tracker.FedexTracker", autospec=True) as FT:
             FT.side_effect = AssertionError("FedexTracker should not be constructed for UPS")
             ut = UnifiedTracker()
-            with self.assertRaises(NotImplementedError):
-                ut.track("1Z999AA10123456784", carrier="ups")
+            outcome = ut.track("1Z999AA10123456784", carrier="ups")
+            self.assertEqual(outcome["status"], "not_attempted")
+            FT.assert_not_called()
 
 
 if __name__ == "__main__":

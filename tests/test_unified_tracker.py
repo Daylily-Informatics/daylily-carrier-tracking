@@ -1,32 +1,44 @@
 import unittest
+from unittest.mock import patch
+
+from daylily_carrier_tracking import UnifiedTracker
 
 
 class TestUnifiedTracker(unittest.TestCase):
-    def test_detect_carrier_ups(self):
-        from daylily_carrier_tracking.unified_tracker import detect_carrier
+    @patch("daylily_carrier_tracking.unified_tracker.FedexTracker")
+    def test_unknown_scan_never_loads_fedex(self, fedex):
+        result = UnifiedTracker(fedex_enabled=True).track("000REGIONAL")
+        self.assertEqual(result["status"], "not_attempted")
+        self.assertEqual(result["reason"], "carrier_unknown")
+        self.assertEqual(result["tracking_number"], "000REGIONAL")
+        fedex.assert_not_called()
 
-        self.assertEqual(detect_carrier("1Z999AA10123456784"), "ups")
+    @patch("daylily_carrier_tracking.unified_tracker.FedexTracker")
+    def test_unsupported_lookup_has_no_placeholder_observations(self, fedex):
+        result = UnifiedTracker().track_ops_meta("000REGIONAL", carrier="usps")
+        self.assertEqual(result["status"], "not_attempted")
+        self.assertEqual(result["reason"], "lookup_unsupported")
+        self.assertEqual(result["carrier"], "usps")
+        self.assertNotIn("ops_meta", result)
+        fedex.assert_not_called()
 
-    def test_track_usps_not_implemented(self):
-        from daylily_carrier_tracking.unified_tracker import UnifiedTracker
+    @patch("daylily_carrier_tracking.unified_tracker.FedexTracker")
+    def test_manual_fedex_selection_preserves_unknown_identifier(self, fedex):
+        fedex.return_value.track.return_value = {"carrier": "fedex", "tracking_number": "000REGIONAL", "ops_meta": {}}
+        result = UnifiedTracker(fedex_enabled=True).track("000REGIONAL", carrier="FedEx", include_raw=False)
+        self.assertEqual(result["status"], "succeeded")
+        fedex.return_value.track.assert_called_once_with("000REGIONAL", include_raw=False, api_preference="track")
 
-        ut = UnifiedTracker(fedex_config={"api_url": "x", "client_id": "x", "client_secret": "x"})
-        with self.assertRaises(NotImplementedError):
-            ut.track("9400...", carrier="usps")
+    @patch("daylily_carrier_tracking.unified_tracker.FedexTracker")
+    def test_explicit_disable_wins_over_supplied_config(self, fedex):
+        result = UnifiedTracker(fedex_enabled=False, fedex_config={}).track("000REGIONAL", carrier="fedex")
+        self.assertEqual(result["reason"], "lookup_disabled")
+        fedex.assert_not_called()
 
-    def test_track_ops_meta_includes_carrier_for_unimplemented(self):
-        from daylily_carrier_tracking.unified_tracker import UnifiedTracker
-
-        ut = UnifiedTracker()
-        ops = ut.track_ops_meta("1Z999AA10123456784", carrier="ups")
-        self.assertEqual(ops.get("Carrier"), "ups")
-
-    def test_track_ops_meta_auto_detect_sets_carrier(self):
-        from daylily_carrier_tracking.unified_tracker import UnifiedTracker
-
-        ut = UnifiedTracker()
-        ops = ut.track_ops_meta("1Z999AA10123456784", carrier="auto")
-        self.assertEqual(ops.get("Carrier"), "ups")
+    def test_missing_credentials_report_skipped(self):
+        result = UnifiedTracker(fedex_config={}).track("000REGIONAL", carrier="fedex")
+        self.assertEqual(result["status"], "not_attempted")
+        self.assertEqual(result["reason"], "configuration_error")
 
 
 if __name__ == "__main__":

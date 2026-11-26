@@ -77,8 +77,8 @@ class TestFedexTracker(unittest.TestCase):
         self.assertEqual(ops["Transit_Time_sec"], -1)
 
     @patch("daylily_carrier_tracking.fedex_tracker.requests.post")
-    def test_auto_fallback_to_ship_on_notfound(self, post):
-        from daylily_carrier_tracking.fedex_tracker import FedexTracker
+    def test_not_found_is_a_failed_lookup(self, post):
+        from daylily_carrier_tracking import UnifiedTracker
 
         oauth_ok = _Resp(200, {"access_token": "tok", "expires_in": 3600})
         track_notfound = _Resp(
@@ -91,6 +91,18 @@ class TestFedexTracker(unittest.TestCase):
                 }
             },
         )
+        post.side_effect = [oauth_ok, track_notfound]
+        result = UnifiedTracker(fedex_config=self._cfg()).track("X", carrier="fedex")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "not_found")
+        self.assertNotIn("ops_meta", result)
+        self.assertEqual(post.call_count, 2)
+
+    @patch("daylily_carrier_tracking.fedex_tracker.requests.post")
+    def test_explicit_ship_endpoint(self, post):
+        from daylily_carrier_tracking import FedexTracker
+
+        oauth_ok = _Resp(200, {"access_token": "tok", "expires_in": 3600})
         ship_ok = _Resp(
             200,
             {
@@ -113,13 +125,27 @@ class TestFedexTracker(unittest.TestCase):
             },
         )
 
-        # Order: oauth, track, ship
-        post.side_effect = [oauth_ok, track_notfound, ship_ok]
+        post.side_effect = [oauth_ok, ship_ok]
 
         tracker = FedexTracker(config=self._cfg())
-        out = tracker.track("X", api_preference="auto", include_raw=False)
+        out = tracker.track("X", api_preference="ship", include_raw=False)
         self.assertEqual(out["source"]["api"], "ship_v1")
         self.assertEqual(out["ops_meta"]["Delivery_Status"], "Delivered")
+
+    @patch("daylily_carrier_tracking.fedex_tracker.requests.post")
+    def test_lookup_keeps_mismatched_observations_out_of_result(self, post):
+        from daylily_carrier_tracking import UnifiedTracker
+
+        post.side_effect = [
+            _Resp(200, {"access_token": "tok"}),
+            _Resp(200, {"output": {"completeTrackResults": [{"trackResults": [
+                {"trackingNumberInfo": {"trackingNumber": "DIFFERENT"}}
+            ]}]}}),
+        ]
+        result = UnifiedTracker(fedex_config=self._cfg()).track("X", carrier="fedex")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "invalid_response")
+        self.assertNotIn("ops_meta", result)
 
 
 if __name__ == "__main__":

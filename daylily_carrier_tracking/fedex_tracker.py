@@ -1,14 +1,40 @@
-import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlsplit
 
 import requests
+from yaml import YAMLError
+
+from .config import config_path, load_yaml_mapping
+
+
+class FedexConfigurationError(ValueError):
+    """A caller must configure the provider before a request can be made."""
+
+
+class FedexLookupError(RuntimeError):
+    """A failed provider operation, with an operator-safe message."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+def _endpoint(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            parsed = urlsplit(value)
+            if parsed.scheme in {"https", "http"} and parsed.hostname:
+                return value
+        except ValueError:
+            pass
+    raise FedexConfigurationError("The selected FedEx endpoint requires an absolute HTTP URL.")
 
 
 def _parse_iso_datetime(value: str) -> Optional[datetime]:
-    if not value:
+    if not isinstance(value, str) or not value:
         return None
     # Python 3.10 datetime.fromisoformat() does not accept trailing 'Z'
     if value.endswith("Z"):
@@ -143,26 +169,70 @@ def normalize_fedex_track_ops_meta(raw: Dict[str, Any]) -> Dict[str, Any]:
     ops["Ship_weekday"] = _weekday_name(ship_dt)
 
     transit = ""
-    if delivery_dt and tender_dt:
-        transit = (delivery_dt - tender_dt).total_seconds()
-    elif delivery_dt and ship_dt:
-        transit = (delivery_dt - ship_dt).total_seconds()
+    start_dt = tender_dt or ship_dt
+    if start_dt and delivery_dt and (start_dt.tzinfo is None) == (delivery_dt.tzinfo is None):
+        transit = (delivery_dt - start_dt).total_seconds()
     ops["Transit_Time_sec"] = transit
 
     return ops
 
 
-def _looks_not_found(raw: Dict[str, Any]) -> bool:
-    track_results = _get_nested(raw, ("output", "completeTrackResults"), default=[])
-    if not track_results:
-        return False
-    trk_res_list = track_results[0].get("trackResults") or []
-    if not trk_res_list:
-        return False
-    trk_res = trk_res_list[0]
-    err = trk_res.get("error") if isinstance(trk_res, dict) else None
-    code = (err or {}).get("code", "")
-    return "NOTFOUND" in str(code).upper()
+def _provider_error(errors: Any) -> FedexLookupError:
+    if not isinstance(errors, list):
+        errors = [errors]
+    for error in errors:
+        if isinstance(error, dict):
+            code = str(error.get("code", "")).upper()
+            if "TRACKING" in code and "NOTFOUND" in code.replace(".", ""):
+                return FedexLookupError("not_found", "FedEx could not find this tracking number.")
+    return FedexLookupError("provider_error", "FedEx reported an error during the lookup.")
+
+
+def _require_tracking_result(raw: Dict[str, Any], requested_number: str) -> None:
+    if raw.get("errors"):
+        raise _provider_error(raw["errors"])
+    groups = _get_nested(raw, ("output", "completeTrackResults"), default=None)
+    if isinstance(groups, list) and len(groups) == 1 and isinstance(groups[0], dict):
+        records = groups[0].get("trackResults")
+        if isinstance(records, list) and len(records) == 1 and isinstance(records[0], dict) and records[0]:
+            record = records[0]
+            if record.get("error"):
+                raise _provider_error(record["error"])
+            returned_numbers = (groups[0].get("trackingNumber"),
+                                _get_nested(record, ("trackingNumberInfo", "trackingNumber"), None))
+            if any(value is not None and value != requested_number for value in returned_numbers):
+                raise FedexLookupError("invalid_response", "FedEx returned details for a different tracking number.")
+            return
+    raise FedexLookupError("invalid_response", "FedEx did not return a single tracking result.")
+
+
+def _post(url: str, *, oauth: bool = False, **kwargs: Any) -> tuple[dict, int]:
+    try:
+        response = requests.post(url, **kwargs)
+    except (requests.exceptions.MissingSchema, requests.exceptions.InvalidSchema, requests.exceptions.InvalidURL):
+        raise FedexConfigurationError("The selected FedEx endpoint URL is invalid.") from None
+    except requests.Timeout:
+        raise FedexLookupError("provider_timeout", "The FedEx request timed out.") from None
+    except requests.RequestException:
+        raise FedexLookupError("provider_unreachable", "The FedEx service could not be reached.") from None
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        if response.status_code in (401, 403) or (oauth and response.status_code == 400):
+            raise FedexLookupError("authentication_failed", "FedEx rejected the configured credentials or access.") from None
+        try:
+            error_body = response.json()
+        except ValueError:
+            error_body = {}
+        errors = error_body.get("errors") if isinstance(error_body, dict) else None
+        raise _provider_error(errors) from None
+    try:
+        data = response.json()
+    except ValueError:
+        raise FedexLookupError("invalid_response", "FedEx returned unreadable JSON.") from None
+    if not isinstance(data, dict):
+        raise FedexLookupError("invalid_response", "FedEx returned an unexpected response format.")
+    return data, response.status_code
 
 
 @dataclass
@@ -193,80 +263,54 @@ class FedexOAuthTokenProvider:
             "client_secret": self._client_secret,
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        resp = requests.post(self._oauth_url, data=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _ = _post(self._oauth_url, oauth=True, data=payload, headers=headers)
         token = data.get("access_token")
-        if not token:
-            raise RuntimeError(f"FedEx OAuth response missing access_token: {json.dumps(data)[:500]}")
-        expires_in = int(data.get("expires_in", 3300))
+        if not isinstance(token, str) or not token:
+            raise FedexLookupError("authentication_failed", "FedEx did not issue an OAuth access token.")
+        try:
+            expires_in = int(data.get("expires_in", 3300))
+            expires_at = now + timedelta(seconds=max(0, expires_in - 60))
+        except (TypeError, ValueError, OverflowError):
+            raise FedexLookupError("invalid_response", "FedEx returned an invalid OAuth token lifetime.") from None
 
         # Refresh a bit early.
         self._token = token
-        self._expires_at = now + timedelta(seconds=max(60, expires_in - 60))
+        self._expires_at = expires_at
         return token
 
 
 class FedexTracker:
-    """Unified FedEx tracker.
-
-    - Supports Track API v1 out of the box.
-    - Supports an optional 'Ship API v1 tracking-like endpoint' if configured.
-
-    You can route via api_preference:
-      - 'track'  : Track API only
-      - 'ship'   : Ship endpoint only (requires ship_track_url)
-      - 'auto'   : Track first; if NOTFOUND and ship is configured, try ship
-    """
+    """Direct FedEx client. Each lookup uses the caller's selected endpoint."""
 
     def __init__(
         self,
         config_proj_name: str = "fedex",
         config_proj_env: str = "prod",
         config: Optional[Dict[str, Any]] = None,
-        track_url: str = "https://apis.fedex.com/track/v1/trackingnumbers",
+        track_url: Optional[str] = None,
         ship_track_url: Optional[str] = None,
     ):
         if config is None:
-            cfg: Dict[str, Any]
-            # Preferred location (centralized):
-            #   ~/.config/daylily-carrier-tracking/<proj>_<env>.yaml
             try:
-                from daylily_carrier_tracking.config import config_path, load_yaml_mapping
-
-                new_path = config_path(config_proj_name, config_proj_env)
-                if new_path.exists():
-                    cfg = load_yaml_mapping(new_path)
-                else:
-                    raise FileNotFoundError(str(new_path))
-            except Exception:
-                # Backward-compatible fallback:
-                #   ~/.config/<proj>/<proj>_<env>.yaml  (yaml_config_day)
-                try:
-                    import yaml_config_day.config_manager as YCM  # type: ignore
-                except ModuleNotFoundError as e:
-                    raise ModuleNotFoundError(
-                        "No config found in the new default location (~/.config/daylily-carrier-tracking/) "
-                        "and yaml_config_day is not installed for legacy config loading. "
-                        "Either install yaml_config_day, or create a config file at: "
-                        f"~/.config/daylily-carrier-tracking/{config_proj_name}_{config_proj_env}.yaml, "
-                        "or pass config={...} when constructing FedexTracker."
-                    ) from e
-
-                yconfig = YCM.ProjectConfigManager(config_proj_name, config_proj_env)
-                cfg = yconfig.get_config()
+                cfg = load_yaml_mapping(config_path(config_proj_name, config_proj_env))
+            except (OSError, YAMLError, ValueError):
+                raise FedexConfigurationError("The FedEx configuration could not be loaded.") from None
         else:
-            cfg = dict(config)
+            if not isinstance(config, dict):
+                raise FedexConfigurationError("The FedEx configuration must be a mapping.")
+            cfg = config
 
         oauth_url = cfg.get("oauth_url") or cfg.get("api_url")
-        if not oauth_url:
-            raise ValueError("Missing oauth_url/api_url in config")
+        if cfg.get("oauth_url") and cfg.get("api_url") and cfg["oauth_url"] != cfg["api_url"]:
+            raise FedexConfigurationError("The FedEx configuration specifies conflicting OAuth endpoints.")
+        if any(not isinstance(x, str) or not x.strip() for x in (oauth_url, cfg.get("client_id"), cfg.get("client_secret"))):
+            raise FedexConfigurationError("FedEx requires an OAuth URL, client ID and client secret.")
 
         self._track_url = cfg.get("track_url") or track_url
         self._ship_track_url = cfg.get("ship_track_url") or ship_track_url
 
         self._token_provider = FedexOAuthTokenProvider(
-            oauth_url=oauth_url,
+            oauth_url=_endpoint(oauth_url),
             client_id=cfg["client_id"],
             client_secret=cfg["client_secret"],
         )
@@ -279,43 +323,37 @@ class FedexTracker:
             "Authorization": "Bearer " + token,
         }
         started = time.time()
-        resp = requests.post(url, data=json.dumps(payload), headers=headers)
+        data, http_status = _post(url, json=payload, headers=headers)
         elapsed_ms = int((time.time() - started) * 1000)
-        http_status = getattr(resp, "status_code", None)
-        data = resp.json()
         return data, FedexApiCallMeta(api=api_name, url=url, http_status=http_status, elapsed_ms=elapsed_ms)
 
     def auth_token(self) -> str:
         return self._token_provider.get_token()
 
-    def track_raw(self, tracking_number: str, api_preference: str = "auto") -> Tuple[Dict[str, Any], FedexApiCallMeta]:
+    def track_raw(self, tracking_number: str, api_preference: str = "track") -> Tuple[Dict[str, Any], FedexApiCallMeta]:
+        """Return the raw JSON from the selected endpoint, including FedEx application errors."""
         payload = {
             "includeDetailedScans": True,
             "trackingInfo": [{"trackingNumberInfo": {"trackingNumber": str(tracking_number)}}],
         }
 
-        api_preference = (api_preference or "auto").lower()
-        if api_preference not in {"auto", "track", "ship"}:
-            raise ValueError("api_preference must be one of: auto, track, ship")
+        if api_preference not in {"track", "ship"}:
+            raise ValueError("api_preference must be 'track' or 'ship'")
+        url = self._track_url if api_preference == "track" else self._ship_track_url
+        if not isinstance(url, str) or not url.strip():
+            raise FedexConfigurationError("The selected FedEx tracking endpoint is not configured.")
+        return self._post_json(_endpoint(url), payload, api_name=api_preference + "_v1")
 
-        if api_preference in {"track", "auto"}:
-            raw, meta = self._post_json(self._track_url, payload, api_name="track_v1")
-            if api_preference == "track":
-                return raw, meta
-            if not _looks_not_found(raw) or not self._ship_track_url:
-                return raw, meta
+    def track_ops_meta(self, tracking_number: str, api_preference: str = "track") -> Dict[str, Any]:
+        return self.track(tracking_number, api_preference=api_preference, include_raw=False)["ops_meta"]
 
-        if not self._ship_track_url:
-            raise RuntimeError("Ship API fallback requested but ship_track_url is not configured")
-        raw, meta = self._post_json(self._ship_track_url, payload, api_name="ship_v1")
-        return raw, meta
-
-    def track_ops_meta(self, tracking_number: str, api_preference: str = "auto") -> Dict[str, Any]:
-        raw, _ = self.track_raw(tracking_number, api_preference=api_preference)
-        return normalize_fedex_track_ops_meta(raw)
-
-    def track(self, tracking_number: str, api_preference: str = "auto", include_raw: bool = True) -> Dict[str, Any]:
+    def track(self, tracking_number: str, api_preference: str = "track", include_raw: bool = True) -> Dict[str, Any]:
         raw, meta = self.track_raw(tracking_number, api_preference=api_preference)
+        _require_tracking_result(raw, str(tracking_number))
+        try:
+            ops = normalize_fedex_track_ops_meta(raw)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            raise FedexLookupError("invalid_response", "FedEx returned an unreadable tracking result.") from None
         out = {
             "carrier": "fedex",
             "tracking_number": str(tracking_number),
@@ -325,7 +363,7 @@ class FedexTracker:
                 "http_status": meta.http_status,
                 "elapsed_ms": meta.elapsed_ms,
             },
-            "ops_meta": normalize_fedex_track_ops_meta(raw),
+            "ops_meta": ops,
         }
         if include_raw:
             out["raw"] = raw

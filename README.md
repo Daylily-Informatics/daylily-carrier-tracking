@@ -1,474 +1,87 @@
-# daylily-carrier-tracking
+# Daylily Carrier Tracking
 
-Unified multi-carrier package tracking library + CLI.
-
-## Implementation status
-
-- **FedEx**: implemented (OAuth2 + Track API v1, with optional Ship fallback)
-- **UPS**: scaffolded (config + CLI plumbing; live tracking not implemented yet)
-- **USPS**: scaffolded (config + CLI plumbing; live tracking not implemented yet)
+Identify the carrier from a scanned tracking number or shipping barcode, then request live tracking if the selected carrier is FedEx. Recognition runs entirely on the local machine, including for numbers the library has never seen. It returns the original scan, a decision and the plausible carriers. A matching format identifies a carrier candidate. It cannot establish that a shipment exists.
 
 ## Install
 
-### Install from PyPI (recommended for end users)
+Python 3.10 or later:
 
-This installs the library and the `tday` CLI into your environment.
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -U pip
-python -m pip install daylily-carrier-tracking
-
-tday --help
+```sh
+python -m pip install daylily-carrier-tracking==1.0.0
 ```
 
-### Recommended (development, isolated virtualenv)
+Upgrading from 0.5.1? The migration guide covers the replacement for `detect_carrier()`, the lookup result envelope, FedEx enablement and the CLI changes. [Migration guide](https://github.com/Daylily-Informatics/daylily-carrier-tracking/blob/1.0.0/docs/migration-1.0.md)
 
-This repo includes a helper script that **always** installs into a local `./.venv` so you don't accidentally `pip install -e .` into your system/base Python.
+## Recognize a scan
 
-```bash
-./dev-setup.sh
+```sh
+tday recognize 1Z5R89390357567127 --pretty
 ```
 
-If you want the venv **activated in your current shell** (so `tday ...` works without `./`), source it:
-
-```bash
-. ./dev-setup.sh
+```json
+{
+  "scan": "1Z5R89390357567127",
+  "status": "identified",
+  "candidates": [
+    {"carrier_id": "ups", "display_name": "UPS", "tracking_number": "1Z5R89390357567127"}
+  ]
+}
 ```
 
-After setup you can run either:
+These examples can all be recognized offline. The UPS and FedEx inputs come from the bundled barcode catalog.
 
-```bash
-./tday --help   # wrapper; prefers ./.venv/bin/python automatically
-tday --help     # console script (when your venv is active)
+| Scan | What the application can do |
+| --- | --- |
+| `1Z5R89390357567127` | Preselect UPS. An operator can change the selection. |
+| `RB123456785GB` | Offer the postal issuer as a candidate. This shared international postal format leaves the delivery carrier ambiguous. |
+| `0000-NORTH-7` | Keep the exact text and leave the carrier unknown. |
+| `32971514560102447849175802862014` | Retain the full FedEx ASTRA scan and use the embedded `784917580286` for a FedEx query. |
+
+```python
+from daylily_carrier_tracking import recognize_tracking_number
+
+result = recognize_tracking_number("1Z5R89390357567127")
+suggested = result.candidates[0] if result.status == "identified" else None
+print(result.scan, suggested.carrier_id if suggested else "Unknown")
 ```
 
-### Manual install (advanced)
+An ambiguous result can have a single candidate when the format is shared. Check `status` before preselecting. Candidates can include carriers without a live adapter. The bundled catalog includes UPS, FedEx, USPS, DHL, Canada Post, Amazon and regional carriers. The reference describes coverage, the treatment of routing fields and the full Python result contract. [Python reference](https://github.com/Daylily-Informatics/daylily-carrier-tracking/blob/1.0.0/REQUIREMENTS.md) · [Upstream format catalog v2.0.0](https://github.com/jkeen/tracking_number_data/tree/v2.0.0)
 
-Only do this if you know what you're doing; the helper above is safer.
+## Look up the selected number
 
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .
+FedEx is the live provider in 1.0.0. In Python, pass the FedEx configuration explicitly, or set `fedex_enabled=True` to use a configured file. A default `UnifiedTracker()` leaves live access disabled. The CLI's `track` command opts in and uses the configured FedEx file when applicable.
+
+```python
+import os
+from daylily_carrier_tracking import UnifiedTracker
+
+tracker = UnifiedTracker(fedex_config={
+    "oauth_url": "https://apis.fedex.com/oauth/token",
+    "track_url": "https://apis.fedex.com/track/v1/trackingnumbers",
+    "client_id": os.environ["FEDEX_CLIENT_ID"],
+    "client_secret": os.environ["FEDEX_CLIENT_SECRET"],
+})
+# scanner_text and selected_carrier come from the calling application.
+outcome = tracker.track(scanner_text, carrier=selected_carrier, include_raw=False)
+if outcome["status"] == "succeeded":
+    print(outcome["ops_meta"]["Delivery_Status"])
+elif outcome["status"] == "failed":
+    print(outcome["reason"], outcome["message"])
 ```
 
-### direnv (optional)
-
-`.envrc` is gitignored by design. Use the provided example:
-
-```bash
-cp .envrc.example .envrc
-direnv allow
-```
-
-### Repo checkout usage without install
-
-You can run the repo wrapper directly; if `./.venv` exists it will be used automatically.
-
-```bash
-./tday --help
-```
-
-### Deprecated wrapper
-
-```bash
-./tracking_day --help
-```
-
-## Configuration
-
-### Config locations
-
-New default location (preferred):
-
-```text
-~/.config/daylily-carrier-tracking/<carrier>_<env>.yaml
-```
-
-Example:
-
-```text
-~/.config/daylily-carrier-tracking/fedex_prod.yaml
-```
-
-Legacy fallback (for backward compatibility in some code paths):
-
-```text
-~/.config/<carrier>/<carrier>_<env>.yaml
-```
-
-### Environments
-
-`<env>` is a free-form string used in the filename suffix.
-
-- Default: `prod`
-- Common alternatives: `test`, `sandbox`, `dev`
-
-### YAML examples
-
-FedEx (required keys: `oauth_url` (or `api_url`), `client_id`, `client_secret`):
-
-```yaml
----
-oauth_url: https://apis.fedex.com/oauth/token
-client_id: "YOUR_FEDEX_CLIENT_ID"
-client_secret: "YOUR_FEDEX_CLIENT_SECRET"
-
-# Optional overrides:
-track_url: https://apis.fedex.com/track/v1/trackingnumbers
-ship_track_url: ""  # set to https://apis.fedex.com/ship/v1/trackingnumbers to enable ship fallback
-```
-
-UPS (scaffolded; `doctor` currently validates presence of `client_id` + `client_secret`):
-
-```yaml
----
-client_id: "YOUR_UPS_CLIENT_ID"
-client_secret: "YOUR_UPS_CLIENT_SECRET"
-```
-
-USPS (scaffolded; `doctor` currently validates presence of `client_id` + `client_secret`):
-
-```yaml
----
-client_id: "YOUR_USPS_CLIENT_ID"
-client_secret: "YOUR_USPS_CLIENT_SECRET"
-```
-
-### Interactive wizard
-
-Create/update config files interactively:
-
-```bash
-tday configure fedex --env prod
-tday configure ups --env prod
-tday configure usps --env prod
-```
-
-Notes:
-
-- `configure fedex` prompts for credentials and can validate them via an OAuth token request.
-- `configure ups/usps` currently writes a placeholder YAML and exits non-zero (see Exit Codes).
+An explicit carrier selection takes precedence over recognition. Passing `carrier="auto"` requests automatic selection. An unrecognized or ambiguous scan, a disabled adapter or a carrier without live support yields `not_attempted`. When FedEx is contacted and the request fails, the result is `failed`. A receiving application can use that distinction to decide when to record a failure note. The application owns its records and persistence.
 
 ## CLI
 
-All commands:
-
-```bash
-tday --help
-tday <command> --help
-```
-
-### Global flags
-
-- `--pretty`: pretty-print JSON output (applies to JSON-producing commands like `track`)
-- `--no-color`: disable ANSI colored status output on stderr
-  - Also respected via `NO_COLOR=1`
-
-### Shell tab completion (bash/zsh)
-
-This repo includes completion scripts under `./completions/` and the CLI can also print them on-demand:
-
-- `tday completion bash`
-- `tday completion zsh`
-
-- Bash: `completions/tday.bash`
-- Zsh: `completions/_tday`
-
-#### Bash
-
-One-shot (current shell):
-
-```bash
-source <(tday completion bash)
-```
-
-Repo checkout (source file directly):
-
-```bash
-source /path/to/daylily-carrier-tracking/completions/tday.bash
-```
-
-To persist, add a `source ...` line to your `~/.bashrc` (or equivalent), e.g.:
-
-```bash
-mkdir -p ~/.bash_completion.d
-tday completion bash > ~/.bash_completion.d/tday
-echo 'source ~/.bash_completion.d/tday' >> ~/.bashrc
-```
-
-#### Zsh
-
-One-shot (current shell):
-
-```bash
-source <(tday completion zsh)
-```
-
-Install (write into a completions dir):
-
-```bash
-mkdir -p ~/.zsh/completions
-tday completion zsh > ~/.zsh/completions/_tday
-```
-
-Then ensure your `~/.zshrc` contains something like:
-
-```bash
-fpath=(~/.zsh/completions $fpath)
-autoload -Uz compinit
-compinit
-```
-
-Note: the completion targets the installed command name `tday`. If you mainly run the repo wrapper `./tday`, use:
-
-```bash
-# activate the venv so the installed console script is on PATH
-. ./.venv/bin/activate
-tday --help
-```
-
-The completion scripts are intentionally registered **only** for the `tday` command name (not `./tday`, and not the deprecated `tracking_day`).
-
-### `tday test`
-
-Run unit tests.
-
-```bash
-tday test
-tday test --test-fedex
-tday test --test-ups
-tday test --test-usps
-```
-
-Notes:
-
-- Carrier-specific test selection looks for `tests/test_<carrier>_*.py`.
-
-### `tday configure`
-
-Interactive credential setup wizard.
-
-```bash
-tday configure <fedex|ups|usps> [--env prod] [--path /custom/path.yaml] [--skip-validate]
-```
-
-### `tday track`
-
-Perform a live tracking call and print a JSON result to stdout.
-
-```bash
-tday track <TRACKING_NUMBER> \
-  --carrier auto|fedex|ups|usps \
-  [--api-preference auto|track|ship] \
-  [--no-raw] \
-  [--pretty]
-```
-
-Key flags:
-
-- `--carrier`
-  - `auto` uses `detect_carrier()` to guess a carrier (best-effort).
-- `--no-raw` omits the raw carrier payload from the returned JSON.
-- `--api-preference` (FedEx only)
-  - `track`: Track API only
-  - `ship`: Ship endpoint only (requires `ship_track_url` to be set)
-  - `auto`: try Track first; if the response looks like “not found” and `ship_track_url` is configured, try Ship
-
-Examples:
-
-```bash
-tday track 395579987149 --carrier fedex --api-preference auto --pretty --no-raw
-tday track 1Z999AA10123456784 --carrier auto --pretty
-```
-
-### `tday doctor`
-
-Diagnose config + (optionally) test live FedEx OAuth/track.
-
-```bash
-tday doctor \
-  [--all] \
-  --carrier auto|fedex|ups|usps \
-  [--env prod] \
-  [--config-path /path/to/config.yaml] \
-  [--no-network] \
-  [--tracking-number <TRACKING_NUMBER>] \
-  [--json]
-```
-
-Also supported:
-
-- `--all`: run doctor for **fedex + ups + usps** and emit a single aggregated JSON report (implies `--json`).
-  - Note: `--all` currently **cannot** be combined with `--config-path` (no per-carrier overrides yet).
-
-Examples and sample payloads: see [`docs/doctor-examples.md`](docs/doctor-examples.md).
-
-#### JSON output (`--json`)
-
-`--json` prints structured JSON to **stdout** (CI/support-ticket friendly) and suppresses human/colored output.
-
-High-level shape:
-
-- `doctor_version`
-- `carrier`: `{ requested, detected, effective }`
-- `env`
-- `python`: `{ executable, version }`
-- `package`: `{ file }` (or `{ error }`)
-- `config`: `{ source, path, exists, keys, required, presence, valid, ... }`
-- `network`: `{ requested, implemented, note, oauth, track }`
-- `tracking`: `{ number, normalized, normalized_error }`
-
-Examples:
-
-```bash
-tday doctor --carrier fedex --env prod --tracking-number 395579987149 --json | jq
-tday doctor --carrier ups --env prod --json | jq
-tday doctor --carrier usps --env prod --json | jq
-
-# Aggregate all carriers into one JSON report
-tday doctor --all --env prod --json | jq
-```
-
-#### Carrier auto-detection
-
-If you want `doctor` to infer carrier from the tracking number:
-
-```bash
-tday doctor --carrier auto --tracking-number <TRACKING_NUMBER> --json | jq
-```
-
-### Deprecated aliases
-
-These are kept for backward compatibility and map to `track` internally:
-
-- `tday fedex <TN> [...]` → `tday track <TN> --carrier fedex [...]`
-- `tday ups <TN> [...]` → `tday track <TN> --carrier ups [...]`
-- `tday usps <TN> [...]` → `tday track <TN> --carrier usps [...]`
-
-## Exit codes (CI-friendly)
-
-These are the current conventions used by the CLI:
-
-### `tday doctor`
-
-- `0`: config valid (and any requested FedEx network checks succeeded)
-- `2`: config missing/invalid (all carriers) OR other validation error
-- `3`: FedEx OAuth token request failed
-- `4`: FedEx live track call failed
-
-In `doctor --all` mode, the overall exit code is the “most severe” code across carriers (priority: `4 > 3 > 2 > 0`).
-
-### `tday track`
-
-- `0`: success
-- `1`: runtime error (exception)
-- `2`: carrier not implemented / config issues resulting in `NotImplementedError`
-
-### `tday configure`
-
-- `0`: wrote config (and validation succeeded, if applicable)
-- `2`: UPS/USPS wizard is scaffolded (placeholder written)
-- `3`: FedEx credential validation failed
-
-### `tday test`
-
-- `0`: all selected tests passed
-- `2`: `tests/` missing, or a selected carrier test pattern matched no files
-- otherwise: underlying `python -m unittest` return code
-
-## CI (GitHub Actions) snippet
-
-Minimal CI steps that (a) capture `doctor --json` output to files via `tee`, and (b) **fail the job** on non-zero exit codes.
-
-> Note: GitHub Actions `run:` steps use `bash -e -o pipefail` by default on Linux/macOS runners, so a failing `tday doctor ...` will still fail even when piped to `tee`.
-
-```yaml
-- name: Doctor (UPS)
-  run: tday doctor --carrier ups --env prod --json | tee ups_doctor.json
-
-- name: Doctor (USPS)
-  run: tday doctor --carrier usps --env prod --json | tee usps_doctor.json
-
-- name: Doctor (ALL carriers, single JSON)
-  run: tday doctor --all --env prod --json | tee doctor_all.json
-```
-
-## Credential setup (how to obtain credentials)
-
-This project expects you to create carrier developer credentials and store them locally in `~/.config/daylily-carrier-tracking/`.
-
-### FedEx
-
-Portals/docs (observed 2026-01-22):
-
-- FedEx Developer Portal: https://developer.fedex.com/api/en-us/home.html
-- OAuth/Authorization docs: https://developer.fedex.com/api/en-us/catalog/authorization/v1/docs.html
-
-Typical steps:
-
-1. Create/login to a FedEx Developer account.
-2. Create a project/app and enable APIs:
-   - Track API (v1)
-   - (Optional) Ship API if you want the `ship` fallback route
-3. Generate OAuth2 client credentials (client id / client secret).
-4. Create `~/.config/daylily-carrier-tracking/fedex_prod.yaml` with `oauth_url`, `client_id`, `client_secret`.
-5. Validate:
-
-```bash
-tday doctor --carrier fedex --env prod --json | jq
-```
-
-Notes:
-
-- Production credentials may require additional FedEx account verification/approval.
-- Sandbox vs production endpoints/credentials are distinct; name your `--env` accordingly.
-
-### UPS
-
-Portals/docs (observed 2026-01-22):
-
-- UPS Developer Portal: https://developer.ups.com/
-- OAuth Client Credentials tag/docs entry point: https://developer.ups.com/tag/OAuth-Client-Credentials
-
-Typical steps:
-
-1. Create/login to a UPS Developer account.
-2. Create an app and subscribe to the APIs you need (e.g., Tracking).
-3. Generate OAuth client credentials.
-4. Create `~/.config/daylily-carrier-tracking/ups_prod.yaml` with `client_id` and `client_secret`.
-5. Validate config presence (network checks not implemented yet):
-
-```bash
-tday doctor --carrier ups --env prod --json | jq
-```
-
-### USPS
-
-Portals/docs (observed 2026-01-22):
-
-- USPS Developer Portal: https://developers.usps.com/home
-- USPS Web Tools overview: https://www.usps.com/business/web-tools-apis/
-
-Typical steps:
-
-1. Create/login to the USPS Developer Portal.
-2. Request access to the relevant APIs for tracking.
-3. Create `~/.config/daylily-carrier-tracking/usps_prod.yaml` with `client_id` and `client_secret`.
-4. Validate config presence (network checks not implemented yet):
-
-```bash
-tday doctor --carrier usps --env prod --json | jq
-```
-
-Note (time-sensitive): The USPS Web Tools page currently warns that legacy Web Tools APIs are being sunset (see USPS site for the current status).
-
-## Tests
-
-```bash
-python -m unittest discover -s tests
-```
- 
- 
+| Command | Behavior |
+| --- | --- |
+| `tday recognize SCAN [--pretty]` | Print offline recognition JSON. All three recognition outcomes exit 0. |
+| `tday track SCAN [--carrier ID] [--no-raw] [--pretty]` | Print lookup JSON. Exit 0 for success, 2 for a skipped lookup and 1 for a failed lookup. Quote the scan if it contains whitespace. |
+| `tday configure fedex --env prod` | Write the FedEx config interactively and request an OAuth token to validate credentials. Use `--skip-validate` to write config without the request. |
+| `tday doctor --tracking-number SCAN --no-network --json` | Show recognition, effective carrier and applicable configuration diagnostics locally. Omitting `--no-network` permits the FedEx OAuth or lookup operation. [Diagnostic examples and exit codes](https://github.com/Daylily-Informatics/daylily-carrier-tracking/blob/1.0.0/docs/doctor-examples.md) |
+| `tday completion bash` or `tday completion zsh` | Print the completion script for the installed CLI. |
+| `tday test` | Invoke the repository's unit-test runner from a checkout containing the tests. |
+
+Configure the default FedEx production profile with the wizard or inject the same keys from a secrets manager. The standard file is `fedex_prod.yaml` in the `daylily-carrier-tracking` directory below the user's home configuration directory (`.config`). The Track endpoint is selected by default. The optional `--api-preference ship` requires an explicitly configured `ship_track_url`. Each lookup uses one selected route. [FedEx developer portal](https://developer.fedex.com/api/en-us/home.html)
+
+For development, run the repository's `dev-setup.sh` to install into its local virtual environment. The `tday` launcher and shell completions are available from the checkout. The maintained commands are `tday recognize`, `tday track` and `tday doctor`; consult `tday --help` for the full command list.
